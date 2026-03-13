@@ -4,7 +4,7 @@
 # local development and CI. Colab users: run `setup()` which handles installs.
 
 # Core scientific stack (pre-installed in Colab — listed for local/CI)
-numpy>=1.24,<2.0
+numpy>=1.24
 pandas>=2.0
 scipy>=1.11
 matplotlib>=3.7
@@ -27,15 +27,15 @@ dask==2025.12.0
 bottleneck==1.6.0
 h5netcdf==1.7.3
 hdf5plugin==6.0.0
-opencv-python==4.12.0
+opencv-python==4.12.0.88
 
 # Solar physics / visualization
-sunpy==7.1.0
+sunpy==6.1.2
 
 # Notebook extensions (Colab use is optional)
-ipykernel==8.21.0
+ipykernel==6.30.1
 ipywidgets==8.1.8
-jupyter_contrib_nbextensions==6.5.4
+# jupyter_contrib_nbextensions==6.5.4  # optional; can conflict with Colab kernels
 
 # Logging / experiment tracking
 # wandb==0.23.1
