@@ -85,6 +85,6 @@ setup()
 - Use Colab Pro for GPU-accelerated training (weeks 06+)
 - Questions → open a GitHub Discussion, not email
 
-## For the PI
+## For the PI 
 
 See `CLAUDE.md` for AI assistant context and `infrastructure/` for the module API. -->
