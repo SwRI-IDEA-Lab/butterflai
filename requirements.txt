@@ -1,0 +1,22 @@
+# ButterflAI requirements.txt
+# Colab-compatible pinned dependencies.
+# Note: torch and torchvision are pre-installed in Colab; listed here for
+# local development and CI. Colab users: run `setup()` which handles installs.
+
+# Core scientific stack (pre-installed in Colab — listed for local/CI)
+numpy>=1.24,<2.0
+pandas>=2.0
+scipy>=1.11
+matplotlib>=3.7
+
+# Deep learning (pre-installed in Colab with GPU support)
+torch>=2.1
+pytorch-lightning>=2.1
+
+# Data access
+requests>=2.31
+tqdm>=4.66
+
+# Optional: solar physics data (install as needed in notebooks)
+# sunpy>=5.0
+# astropy>=5.3
