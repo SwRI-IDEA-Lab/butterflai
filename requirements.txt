@@ -10,45 +10,45 @@ scipy>=1.11
 matplotlib>=3.7
 
 # Deep learning (pre-installed in Colab with GPU support)
-torch>=2.1
-torchvision>=0.16
-lightning>=2.1
+# torch>=2.1
+# torchvision>=0.16
+# lightning>=2.1
 
 # Data access
 requests>=2.31
 tqdm>=4.66
 
 # Scientific/analysis packages (mirrors environment.yml)
-numba
-scikit-learn
-scikit-image
-xarray
-dask
-bottleneck
-h5netcdf
-hdf5plugin
-opencv-python
+numba==0.63.1
+scikit-learn==1.8.0
+scikit-image==0.26.0
+xarray==2025.12.0
+dask==2025.12.0
+bottleneck==1.6.0
+h5netcdf==1.7.3
+hdf5plugin==6.0.0
+opencv-python==4.12.0
 
 # Solar physics / visualization
-sunpy
+sunpy==7.1.0
 
 # Notebook extensions (Colab use is optional)
-ipykernel
-ipywidgets
-jupyter_contrib_nbextensions
+ipykernel==8.21.0
+ipywidgets==8.1.8
+jupyter_contrib_nbextensions==6.5.4
 
 # Logging / experiment tracking
-wandb
+# wandb==0.23.1
 
 # HuggingFace ecosystem + utilities
-datasets
-huggingface_hub
-hf_transfer
+# datasets
+# huggingface_hub==0.36.0
+# hf_transfer==0.1.9
 
 # Other ML utilities
-peft
-torchmetrics
-s3fs
-einops
-timm
-boto3
+# peft==0.18.1
+# torchmetrics==1.8.2
+# s3fs==2026.1.0
+# einops==0.8.1
+# timm==1.0.24
+# boto3==1.42.19
