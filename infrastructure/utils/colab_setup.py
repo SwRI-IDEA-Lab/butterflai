@@ -19,19 +19,21 @@ def setup(
     seed: int = 42,
     mount_drive: bool = False,
     drive_data_path: Optional[str] = None,
+    install_requirements: bool = True,
+    requirements_file: str = "requirements.txt",
     install_extra: Optional[list[str]] = None,
     verbose: bool = True,
 ) -> dict:
-    """
-    Initialize the ButterflAI Colab environment.
+    """Initialize the ButterflAI Colab environment.
 
     Performs the following in order:
       1. Detects whether running in Colab or locally
-      2. Installs any missing extra dependencies
-      3. Optionally mounts Google Drive
-      4. Sets global random seeds for reproducibility
-      5. Configures Matplotlib defaults
-      6. Returns an environment info dict
+      2. Optionally installs dependencies from `requirements.txt`
+      3. Installs any missing extra dependencies
+      4. Optionally mounts Google Drive
+      5. Sets global random seeds for reproducibility
+      6. Configures Matplotlib defaults
+      7. Returns an environment info dict
 
     Parameters
     ----------
@@ -42,6 +44,10 @@ def setup(
     drive_data_path : str, optional
         Path within Drive to symlink as /content/butterflai_data.
         E.g. 'MyDrive/ButterflAI/data'
+    install_requirements : bool
+        If True, pip-install dependencies from `requirements_file`.
+    requirements_file : str
+        Path (relative to repo root) to a pip requirements file.
     install_extra : list of str, optional
         Additional pip packages to install (e.g. ['astropy', 'sunpy']).
     verbose : bool
@@ -60,7 +66,14 @@ def setup(
         "data_path": None,
     }
 
-    # --- Extra dependencies ---
+    # --- Install dependencies ---
+    if install_requirements:
+        req_path = _repo_root() / requirements_file
+        if req_path.exists():
+            _pip_install_requirements(req_path, verbose=verbose)
+        elif verbose:
+            print(f"  [Warning] requirements file not found: {req_path}")
+
     if install_extra:
         _pip_install(install_extra, verbose=verbose)
 
@@ -110,6 +123,30 @@ def _pip_install(packages: list[str], verbose: bool = True) -> None:
             check=True,
             capture_output=not verbose,
         )
+
+
+def _pip_install_requirements(requirements_path: Path, verbose: bool = True) -> None:
+    """Install pip requirements from a requirements.txt file."""
+    if verbose:
+        print(f"  Installing from {requirements_path}...")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "-r",
+            str(requirements_path),
+        ],
+        check=True,
+        capture_output=not verbose,
+    )
+
+
+def _repo_root() -> Path:
+    """Return the repository root directory (assumes this file is under infrastructure/)."""
+    return Path(__file__).resolve().parents[2]
 
 
 def _mount_drive(drive_data_path: Optional[str], verbose: bool = True) -> bool:
