@@ -1,4 +1,4 @@
-name: surya_ws
+name: butterflAI
 channels:
   - conda-forge
   - defaults
