@@ -14,7 +14,9 @@ students progressively develop reverse diffusion / score-based generative models
 of producing physically plausible synthetic solar cycles.
 
 **Primary environment:** Google Colab Pro  
-**Stack:** Python · NumPy · Pandas · Matplotlib · SciPy · PyTorch · PyTorch Lightning
+**Stack:** Python · NumPy · Pandas · Matplotlib · SciPy · PyTorch · PyTorch Lightning  
+
+**Dependency source:** Colab notebooks install dependencies via `requirements.txt` (pip). `environment.yml` is provided for local conda setups but is not used by Colab.
 
 ---
 
