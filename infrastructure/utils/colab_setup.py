@@ -126,22 +126,45 @@ def _pip_install(packages: list[str], verbose: bool = True) -> None:
 
 
 def _pip_install_requirements(requirements_path: Path, verbose: bool = True) -> None:
-    """Install pip requirements from a requirements.txt file."""
+    """Install pip requirements from a requirements.txt file.
+
+    If installation fails, this function prints the captured stderr to help
+    diagnose the problem. This is important for Colab, where package resolution
+    failures can be hard to debug.
+    """
     if verbose:
         print(f"  Installing from {requirements_path}...")
-    subprocess.run(
+
+    result = subprocess.run(
         [
             sys.executable,
             "-m",
             "pip",
             "install",
-            "-q",
             "-r",
             str(requirements_path),
         ],
-        check=True,
-        capture_output=not verbose,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+
+    if result.returncode != 0:
+        print("\n[ERROR] pip install failed.\n")
+        if result.stdout:
+            print("--- pip stdout ---")
+            print(result.stdout)
+        if result.stderr:
+            print("--- pip stderr ---")
+            print(result.stderr)
+        raise RuntimeError(
+            "pip install of requirements.txt failed. "
+            "Inspect the output above and consider adjusting requirements.txt "
+            "or using setup(install_requirements=False) and installing only the needed packages."
+        )
+
+    if verbose and result.stdout:
+        print(result.stdout)
 
 
 def _repo_root() -> Path:
