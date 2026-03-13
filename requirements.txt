@@ -10,9 +10,9 @@ scipy>=1.11
 matplotlib>=3.7
 
 # Deep learning (pre-installed in Colab with GPU support)
-torch>=2.1
-torchvision>=0.16
-lightning>=2.1
+# torch>=2.1
+# torchvision>=0.16
+# lightning>=2.1
 
 # Data access
 requests>=2.31
@@ -38,17 +38,17 @@ ipywidgets
 jupyter_contrib_nbextensions
 
 # Logging / experiment tracking
-wandb
+# wandb
 
 # HuggingFace ecosystem + utilities
-datasets
-huggingface_hub
-hf_transfer
+# datasets
+# huggingface_hub
+# hf_transfer
 
 # Other ML utilities
-peft
-torchmetrics
-s3fs
-einops
-timm
-boto3
+# peft
+# torchmetrics
+# s3fs
+# einops
+# timm
+# boto3
