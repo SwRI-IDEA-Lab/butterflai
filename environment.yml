@@ -24,8 +24,10 @@ dependencies:
   - opencv
   - pip
   - pip:
-    - torch
-    - torchvision
+    # CUDA 12.4 build — matches driver on development machines with RTX 4060.
+    # Update the --index-url if your CUDA version differs (e.g. cu121, cu126).
+    - torch --index-url https://download.pytorch.org/whl/cu124
+    - torchvision --index-url https://download.pytorch.org/whl/cu124
     - lightning
     - peft
     - torchmetrics
