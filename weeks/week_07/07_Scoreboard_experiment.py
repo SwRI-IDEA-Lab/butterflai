@@ -670,6 +670,61 @@ def compute_global_nll(fit_results, m_sh=None, b_sh=None):
     return total / max(n_terms, 1)
 
 
+MU0_TEMP = 1.0  # sigmoid temperature T (degrees) for the soft μ₀ threshold
+
+
+def compute_global_nll_soft(fit_results, T=MU0_TEMP, m_sh=None, b_sh=None):
+    """
+    Sigmoid-weighted version of compute_global_nll.
+
+    Replaces the hard μ > μ₀ cutoff with a continuous weight:
+        w(μ, μ₀) = 1 / (1 + exp((μ − μ₀) / T))
+    so every year contributes, but years well above μ₀ (pre-cycle) are
+    down-weighted to near zero.  The normalisation uses the sum of weights
+    rather than a count of included terms, recovering the hard-threshold
+    behaviour as T → 0.
+
+    This formulation is differentiable in all six linear coefficients,
+    enabling gradient-based (L-BFGS-B) optimisation.
+
+    Parameters
+    ----------
+    fit_results : dict with keys 'mu0', 'mu_peak', 'm_i'
+        Each value is a (slope, intercept) tuple.
+    T : float
+        Sigmoid temperature in degrees (default: MU0_TEMP = 1°).
+    m_sh, b_sh : float, optional
+        Override the universal equatorial line parameters.
+
+    Returns
+    -------
+    float — lower is better (nats/year, weighted).
+    """
+    if m_sh is None:
+        m_sh = m_shared_fit
+    if b_sh is None:
+        b_sh = b_shared_fit
+    a_mu0,    b_mu0    = fit_results["mu0"]
+    a_mupeak, b_mupeak = fit_results["mu_peak"]
+    a_mi,     b_mi     = fit_results["m_i"]
+    total_w, sum_w = 0.0, 0.0
+    for A, years_data in cycle_data_global:
+        mu0_p    = a_mu0 * A + b_mu0
+        mupeak_p = a_mupeak * A + b_mupeak
+        mi_p     = a_mi * A + b_mi
+        for tau, mu, lats in years_data:
+            # Clamp exponent to avoid overflow in the sigmoid
+            w = 1.0 / (1.0 + np.exp(np.clip((mu - mu0_p) / T, -500, 500)))
+            if w < 1e-6:
+                continue
+            sigma = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_p)
+            if sigma <= 0:
+                continue
+            total_w -= w * sp_norm.logpdf(lats, loc=mu, scale=sigma).mean()
+            sum_w   += w
+    return total_w / max(sum_w, 1e-10)
+
+
 nll_baseline = compute_global_nll(fit_results_19)
 n_hc_global  = len(cycle_data_global)
 n_terms_all  = sum(len(yd) for _, yd in cycle_data_global)
@@ -770,18 +825,101 @@ plt.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Soft μ₀ Threshold — L-BFGS-B Optimisation
+# ══════════════════════════════════════════════════════════════════════════
+# With the sigmoid weighting the objective is differentiable everywhere,
+# so L-BFGS-B can exploit gradient information.  We initialise from the
+# Task 23 Nelder-Mead solution and let L-BFGS-B refine further.
+
+print(f"\nSoft μ₀ + L-BFGS-B optimisation (T = {MU0_TEMP}°) ...")
+
+
+def _nll_soft_vec(x):
+    return compute_global_nll_soft(_unpack(x), T=MU0_TEMP)
+
+
+x0_soft = _pack(fit_results_23)   # warm-start from Task 23
+
+opt_soft = minimize(
+    _nll_soft_vec,
+    x0_soft,
+    method="L-BFGS-B",
+    options={"maxiter": 10_000, "ftol": 1e-12, "gtol": 1e-8},
+)
+
+fit_results_soft = _unpack(opt_soft.x)
+nll_soft_obj  = compute_global_nll_soft(fit_results_soft)   # soft metric (what was optimised)
+nll_soft_hard = compute_global_nll(fit_results_soft)        # hard metric (scoreboard currency)
+
+print(f"L-BFGS-B converged: {opt_soft.success}  ({opt_soft.message})")
+print(f"  Iterations: {opt_soft.nit}   Function evaluations: {opt_soft.nfev}")
+
+print("\nOptimised coefficients — all three strategies:")
+print(f"  {'param':8s}  {'slope 19':>10s}  {'slope 23':>10s}  {'slope soft':>10s}  "
+      f"  {'int 19':>8s}  {'int 23':>8s}  {'int soft':>8s}")
+for key in ("mu0", "mu_peak", "m_i"):
+    a19, b19   = fit_results_19[key]
+    a23, b23   = fit_results_23[key]
+    asf, bsf   = fit_results_soft[key]
+    print(f"  {key:8s}  {a19:>10.6f}  {a23:>10.6f}  {asf:>10.6f}  "
+          f"  {b19:>8.3f}  {b23:>8.3f}  {bsf:>8.3f}")
+
+# ── Scatter plots: all three regression lines ─────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+for ax, (col, ylabel, color) in zip(axes, param_info):
+    vals = df19[["amplitude", col]].dropna()
+    x, y = vals["amplitude"].values, vals[col].values
+    amp_g = np.linspace(x.min() * 0.9, x.max() * 1.05, 200)
+
+    ax.scatter(x, y, color=color, s=40, alpha=0.80, edgecolors="none", zorder=3)
+
+    for (fr, lbl, ls, lc) in [
+        (fit_results_19,   "Task 19",       "--", "black"),
+        (fit_results_23,   "Task 23 (NM)",  "-",  "tab:red"),
+        (fit_results_soft, f"Soft T={MU0_TEMP}° (LBFGSB)", "-.", "tab:blue"),
+    ]:
+        a, b = fr[col]
+        ax.plot(amp_g, linear_fit(amp_g, a, b), color=lc, linewidth=2,
+                linestyle=ls, label=f"{lbl}  {a:.5f}·A + {b:.2f}")
+
+    for _, row in df19.iterrows():
+        if pd.notna(row["amplitude"]) and pd.notna(row[col]):
+            ax.annotate(f"{int(row['cycle'])}{row['hemisphere'][0].upper()}",
+                        (row["amplitude"], row[col]),
+                        fontsize=5.5, alpha=0.55, xytext=(2, 2),
+                        textcoords="offset points")
+
+    ax.set_xlabel("Peak amplitude (MSH)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{col} vs amplitude")
+    ax.legend(fontsize=6)
+
+plt.suptitle(
+    f"Soft μ₀ threshold (T = {MU0_TEMP}°) + L-BFGS-B vs prior strategies",
+    fontsize=12, y=1.01,
+)
+plt.tight_layout()
+plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Model Quality Scoreboard
 # ══════════════════════════════════════════════════════════════════════════
-fit_results_best = fit_results_23  # swap in any improved model here
+nll_23_hard = compute_global_nll(fit_results_23)
 
-nll_best = compute_global_nll(fit_results_best)
-pct_gain = (nll_baseline - nll_best) / abs(nll_baseline) * 100
+pct_23   = (nll_baseline - nll_23_hard)   / abs(nll_baseline) * 100
+pct_soft = (nll_baseline - nll_soft_hard) / abs(nll_baseline) * 100
 
-print("\n" + "=" * 56)
-print("  Model Quality Scoreboard")
-print("=" * 56)
-print(f"  Baseline (Task 19 two-stage) : {nll_baseline:.5f} nats/year")
-print(f"  Task 23 (end-to-end NLL opt) : {nll_best:.5f} nats/year")
-print(f"  Improvement (Δ NLL)          : {nll_best - nll_baseline:+.5f} nats/year"
-      f"  ({pct_gain:.2f}%)")
-print("=" * 56)
+print("\n" + "=" * 65)
+print("  Model Quality Scoreboard  (hard-threshold NLL, nats/year)")
+print("=" * 65)
+print(f"  Baseline (Task 19 two-stage)          : {nll_baseline:.5f}")
+print(f"  Task 23  (hard cutoff, Nelder-Mead)   : {nll_23_hard:.5f}"
+      f"  ({pct_23:+.2f}%)")
+print(f"  Soft μ₀ T={MU0_TEMP}°  (L-BFGS-B)          : {nll_soft_hard:.5f}"
+      f"  ({pct_soft:+.2f}%)")
+print("-" * 65)
+print(f"  Soft model on its own metric          : {nll_soft_obj:.5f}"
+      f"  (sigmoid-weighted NLL)")
+print("=" * 65)
