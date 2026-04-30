@@ -231,6 +231,32 @@ def piecewise_linear_wing(mu, m_shared, b_shared, mu_peak, m_i):
     )
 
 
+def split_norm_logpdf(x, mu, sigma_L, sigma_R):
+    """
+    Log-pdf of a split-normal distribution.
+
+    The distribution is Gaussian on each side of the mode μ but with
+    independent widths:
+        f(x | μ, σ_L, σ_R) ∝  exp(−(x−μ)²/(2σ_L²))  for x ≥ μ  (poleward)
+                               exp(−(x−μ)²/(2σ_R²))  for x < μ  (equatorward)
+
+    Normalisation constant: A = √(2/π) / (σ_L + σ_R).
+
+    Parameters
+    ----------
+    x : array-like   — observed absolute latitudes
+    mu : float       — predicted mean latitude (mode of the distribution)
+    sigma_L : float  — poleward spread  (x ≥ μ side, high-latitude tail)
+    sigma_R : float  — equatorward spread (x < μ side, low-latitude tail)
+    """
+    log_A = 0.5 * np.log(2.0 / np.pi) - np.log(sigma_L + sigma_R)
+    return np.where(
+        x >= mu,
+        log_A - 0.5 * ((x - mu) / sigma_L) ** 2,
+        log_A - 0.5 * ((x - mu) / sigma_R) ** 2,
+    )
+
+
 eq_mu, eq_sigma = [], []
 for r in results_15:
     mask = r["bin_mu"] <= r["mu_peak"]
@@ -632,7 +658,8 @@ for rec in df19.to_dict("records"):
         cycle_data_global.append((A, years_data))
 
 
-def compute_global_nll(fit_results, m_sh=None, b_sh=None):
+def compute_global_nll(fit_results, m_sh=None, b_sh=None, a_mu=None, b_mu=None,
+                       mi_R_coeffs=None):
     """
     Mean per-year-normalized NLL across all hemisphere-cycles.
 
@@ -642,30 +669,46 @@ def compute_global_nll(fit_results, m_sh=None, b_sh=None):
         Each value is a (slope, intercept) tuple.
     m_sh, b_sh : float, optional
         Override the universal equatorial line parameters.
+    a_mu, b_mu : float, optional
+        Universal mean-path parameters μ(τ) = a·exp(−τ/b).
+        Default: module-level a_mu_univ, b_mu_univ.
+    mi_R_coeffs : (float, float) or None
+        (slope, intercept) for the equatorward-spread amplitude relationship
+        m_i_R(A) = slope·A + intercept.  When None, falls back to the
+        symmetric Gaussian using m_i for both sides.
 
     Returns
     -------
     float — lower is better (nats/year).
     """
-    if m_sh is None:
-        m_sh = m_shared_fit
-    if b_sh is None:
-        b_sh = b_shared_fit
+    if m_sh  is None: m_sh  = m_shared_fit
+    if b_sh  is None: b_sh  = b_shared_fit
+    if a_mu  is None: a_mu  = a_mu_univ
+    if b_mu  is None: b_mu  = b_mu_univ
     a_mu0,    b_mu0    = fit_results["mu0"]
     a_mupeak, b_mupeak = fit_results["mu_peak"]
     a_mi,     b_mi     = fit_results["m_i"]
+    use_split = mi_R_coeffs is not None
+    if use_split:
+        a_mi_R, b_mi_R = mi_R_coeffs
     total, n_terms = 0.0, 0
     for A, years_data in cycle_data_global:
         mu0_p    = a_mu0 * A + b_mu0
         mupeak_p = a_mupeak * A + b_mupeak
         mi_p     = a_mi * A + b_mi
-        for tau, mu, lats in years_data:
+        mi_R_p   = (a_mi_R * A + b_mi_R) if use_split else mi_p
+        for tau, _mu_cached, lats in years_data:
+            mu = a_mu * np.exp(-tau / b_mu)
             if mu > mu0_p:
                 continue
-            sigma = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_p)
-            if sigma <= 0:
+            sigma_L = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_p)
+            sigma_R = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_R_p)
+            if sigma_L <= 0 or sigma_R <= 0:
                 continue
-            total -= sp_norm.logpdf(lats, loc=mu, scale=sigma).mean()
+            if use_split:
+                total -= split_norm_logpdf(lats, mu, sigma_L, sigma_R).mean()
+            else:
+                total -= sp_norm.logpdf(lats, loc=mu, scale=sigma_L).mean()
             n_terms += 1
     return total / max(n_terms, 1)
 
@@ -673,7 +716,8 @@ def compute_global_nll(fit_results, m_sh=None, b_sh=None):
 MU0_TEMP = 1.0  # sigmoid temperature T (degrees) for the soft μ₀ threshold
 
 
-def compute_global_nll_soft(fit_results, T=MU0_TEMP, m_sh=None, b_sh=None):
+def compute_global_nll_soft(fit_results, T=MU0_TEMP, m_sh=None, b_sh=None,
+                            a_mu=None, b_mu=None, mi_R_coeffs=None):
     """
     Sigmoid-weighted version of compute_global_nll.
 
@@ -684,8 +728,8 @@ def compute_global_nll_soft(fit_results, T=MU0_TEMP, m_sh=None, b_sh=None):
     rather than a count of included terms, recovering the hard-threshold
     behaviour as T → 0.
 
-    This formulation is differentiable in all six linear coefficients,
-    enabling gradient-based (L-BFGS-B) optimisation.
+    This formulation is differentiable in all parameters (including a_mu,
+    b_mu, and the split-Gaussian m_i_R), enabling L-BFGS-B optimisation.
 
     Parameters
     ----------
@@ -695,33 +739,48 @@ def compute_global_nll_soft(fit_results, T=MU0_TEMP, m_sh=None, b_sh=None):
         Sigmoid temperature in degrees (default: MU0_TEMP = 1°).
     m_sh, b_sh : float, optional
         Override the universal equatorial line parameters.
+    a_mu, b_mu : float, optional
+        Universal mean-path parameters μ(τ) = a·exp(−τ/b).
+        Default: module-level a_mu_univ, b_mu_univ.
+    mi_R_coeffs : (float, float) or None
+        (slope, intercept) for the equatorward-spread amplitude relationship
+        m_i_R(A) = slope·A + intercept.  When None, falls back to the
+        symmetric Gaussian using m_i for both sides.
 
     Returns
     -------
     float — lower is better (nats/year, weighted).
     """
-    if m_sh is None:
-        m_sh = m_shared_fit
-    if b_sh is None:
-        b_sh = b_shared_fit
+    if m_sh  is None: m_sh  = m_shared_fit
+    if b_sh  is None: b_sh  = b_shared_fit
+    if a_mu  is None: a_mu  = a_mu_univ
+    if b_mu  is None: b_mu  = b_mu_univ
     a_mu0,    b_mu0    = fit_results["mu0"]
     a_mupeak, b_mupeak = fit_results["mu_peak"]
     a_mi,     b_mi     = fit_results["m_i"]
+    use_split = mi_R_coeffs is not None
+    if use_split:
+        a_mi_R, b_mi_R = mi_R_coeffs
     total_w, sum_w = 0.0, 0.0
     for A, years_data in cycle_data_global:
         mu0_p    = a_mu0 * A + b_mu0
         mupeak_p = a_mupeak * A + b_mupeak
         mi_p     = a_mi * A + b_mi
-        for tau, mu, lats in years_data:
-            # Clamp exponent to avoid overflow in the sigmoid
+        mi_R_p   = (a_mi_R * A + b_mi_R) if use_split else mi_p
+        for tau, _mu_cached, lats in years_data:
+            mu = a_mu * np.exp(-tau / b_mu)
             w = 1.0 / (1.0 + np.exp(np.clip((mu - mu0_p) / T, -500, 500)))
             if w < 1e-6:
                 continue
-            sigma = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_p)
-            if sigma <= 0:
+            sigma_L = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_p)
+            sigma_R = piecewise_linear_wing(mu, m_sh, b_sh, mupeak_p, mi_R_p)
+            if sigma_L <= 0 or sigma_R <= 0:
                 continue
-            total_w -= w * sp_norm.logpdf(lats, loc=mu, scale=sigma).mean()
-            sum_w   += w
+            if use_split:
+                total_w -= w * split_norm_logpdf(lats, mu, sigma_L, sigma_R).mean()
+            else:
+                total_w -= w * sp_norm.logpdf(lats, loc=mu, scale=sigma_L).mean()
+            sum_w += w
     return total_w / max(sum_w, 1e-10)
 
 
@@ -904,22 +963,314 @@ plt.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Soft μ₀ + Universal Path (a_mu, b_mu) — L-BFGS-B, 8 parameters
+# ══════════════════════════════════════════════════════════════════════════
+# Extend the 6-parameter soft model by also optimising the two universal
+# mean-path coefficients a_mu_univ and b_mu_univ.  These remain shared
+# across all hemisphere-cycles; each cycle still has its own pre-computed
+# time delay (t0_refined) built into the cached τ values.
+#
+# Parameter vector layout (8 total):
+#   [a_mu0, b_mu0, a_mupeak, b_mupeak, a_mi, b_mi, a_mu, b_mu]
+#    0      1      2         3         4     5     6     7
+
+print(f"\nSoft μ₀ + universal path (8-param) L-BFGS-B optimisation (T = {MU0_TEMP}°) ...")
+
+
+def _pack_ext(fr, a_mu, b_mu):
+    return np.array([
+        fr["mu0"][0],     fr["mu0"][1],
+        fr["mu_peak"][0], fr["mu_peak"][1],
+        fr["m_i"][0],     fr["m_i"][1],
+        a_mu, b_mu,
+    ])
+
+
+def _unpack_ext(x):
+    fr = {
+        "mu0":    (x[0], x[1]),
+        "mu_peak": (x[2], x[3]),
+        "m_i":    (x[4], x[5]),
+    }
+    return fr, float(x[6]), float(x[7])
+
+
+def _nll_soft_ext_vec(x):
+    fr, a_mu, b_mu = _unpack_ext(x)
+    return compute_global_nll_soft(fr, T=MU0_TEMP, a_mu=a_mu, b_mu=b_mu)
+
+
+# Warm-start from the 6-param soft result; a_mu/b_mu start at Section 3 values
+x0_ext = _pack_ext(fit_results_soft, a_mu_univ, b_mu_univ)
+
+# Bounds: a_mu ∈ [5, 30] degrees, b_mu ∈ [1, 15] years; rest unconstrained
+bounds_ext = [(None, None)] * 6 + [(5.0, 30.0), (1.0, 15.0)]
+
+opt_ext = minimize(
+    _nll_soft_ext_vec,
+    x0_ext,
+    method="L-BFGS-B",
+    bounds=bounds_ext,
+    options={"maxiter": 10_000, "ftol": 1e-12, "gtol": 1e-8},
+)
+
+fit_results_ext, a_mu_opt, b_mu_opt = _unpack_ext(opt_ext.x)
+
+# Evaluate on both the soft metric and the hard-threshold metric
+nll_ext_obj  = compute_global_nll_soft(fit_results_ext, a_mu=a_mu_opt, b_mu=b_mu_opt)
+nll_ext_hard = compute_global_nll(fit_results_ext, a_mu=a_mu_opt, b_mu=b_mu_opt)
+
+print(f"L-BFGS-B (8-param) converged: {opt_ext.success}  ({opt_ext.message})")
+print(f"  Iterations: {opt_ext.nit}   Function evaluations: {opt_ext.nfev}")
+print(f"\n  Optimised universal path:  a_mu = {a_mu_opt:.4f}°  (was {a_mu_univ:.4f}°)")
+print(f"                             b_mu = {b_mu_opt:.4f} yr  (was {b_mu_univ:.4f} yr)")
+
+print("\nOptimised amplitude-relationship coefficients — all strategies:")
+print(f"  {'param':8s}  {'slope 19':>10s}  {'slope 23':>10s}  "
+      f"{'slope soft6':>11s}  {'slope ext8':>10s}  "
+      f"  {'int 19':>7s}  {'int 23':>7s}  {'int soft6':>9s}  {'int ext8':>8s}")
+for key in ("mu0", "mu_peak", "m_i"):
+    a19, b19 = fit_results_19[key]
+    a23, b23 = fit_results_23[key]
+    asf, bsf = fit_results_soft[key]
+    aex, bex = fit_results_ext[key]
+    print(f"  {key:8s}  {a19:>10.6f}  {a23:>10.6f}  {asf:>11.6f}  {aex:>10.6f}  "
+          f"  {b19:>7.3f}  {b23:>7.3f}  {bsf:>9.3f}  {bex:>8.3f}")
+
+# ── Scatter plots: all four regression lines ──────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+for ax, (col, ylabel, color) in zip(axes, param_info):
+    vals = df19[["amplitude", col]].dropna()
+    x, y = vals["amplitude"].values, vals[col].values
+    amp_g = np.linspace(x.min() * 0.9, x.max() * 1.05, 200)
+
+    ax.scatter(x, y, color=color, s=40, alpha=0.80, edgecolors="none", zorder=3)
+
+    for (fr, lbl, ls, lc) in [
+        (fit_results_19,  "Task 19",            "--", "black"),
+        (fit_results_23,  "Task 23 (NM)",       "-",  "tab:red"),
+        (fit_results_soft, f"Soft 6p",          "-.", "tab:blue"),
+        (fit_results_ext,  f"Soft+path 8p",     ":",  "tab:green"),
+    ]:
+        a, b = fr[col]
+        ax.plot(amp_g, linear_fit(amp_g, a, b), color=lc, linewidth=2,
+                linestyle=ls, label=f"{lbl}  {a:.5f}·A + {b:.2f}")
+
+    for _, row in df19.iterrows():
+        if pd.notna(row["amplitude"]) and pd.notna(row[col]):
+            ax.annotate(f"{int(row['cycle'])}{row['hemisphere'][0].upper()}",
+                        (row["amplitude"], row[col]),
+                        fontsize=5.5, alpha=0.55, xytext=(2, 2),
+                        textcoords="offset points")
+
+    ax.set_xlabel("Peak amplitude (MSH)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{col} vs amplitude")
+    ax.legend(fontsize=6)
+
+plt.suptitle(
+    f"8-param: Soft μ₀ + universal path  "
+    f"(a_mu={a_mu_opt:.3f}°, b_mu={b_mu_opt:.3f} yr)",
+    fontsize=12, y=1.01,
+)
+plt.tight_layout()
+plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Split-Gaussian + Soft μ₀ + Universal Path — L-BFGS-B, 10 parameters
+# ══════════════════════════════════════════════════════════════════════════
+# Extend the 8p model by replacing the symmetric per-year Gaussian with a
+# split-normal that has independent poleward (σ_L) and equatorward (σ_R)
+# widths.  σ_L is still controlled by m_i; the new m_i_R controls σ_R.
+# Both follow the same piecewise-linear σ(μ) form, so each gets its own
+# amplitude relationship: m_i_R(A) = a_mi_R · A + b_mi_R.
+#
+# Parameter vector layout (10 total):
+#   [a_mu0, b_mu0, a_mupeak, b_mupeak, a_mi, b_mi, a_mu, b_mu, a_mi_R, b_mi_R]
+#    0      1      2         3         4     5     6     7     8       9
+#
+# σ_L = piecewise_linear_wing(μ, m_sh, b_sh, μ_peak, m_i)    ← poleward  (x ≥ μ)
+# σ_R = piecewise_linear_wing(μ, m_sh, b_sh, μ_peak, m_i_R)  ← equatorward (x < μ)
+# log p(x) = log(√(2/π)/(σ_L+σ_R)) − ½((x−μ)/σ_{L or R})²
+
+print(f"\nSplit-Gaussian + Soft μ₀ + universal path (10-param) L-BFGS-B (T = {MU0_TEMP}°) ...")
+
+
+def _pack_10(fr, a_mu, b_mu, mi_R_coeffs):
+    return np.array([
+        fr["mu0"][0],     fr["mu0"][1],
+        fr["mu_peak"][0], fr["mu_peak"][1],
+        fr["m_i"][0],     fr["m_i"][1],
+        a_mu, b_mu,
+        mi_R_coeffs[0],   mi_R_coeffs[1],
+    ])
+
+
+def _unpack_10(x):
+    fr = {
+        "mu0":    (x[0], x[1]),
+        "mu_peak": (x[2], x[3]),
+        "m_i":    (x[4], x[5]),
+    }
+    return fr, float(x[6]), float(x[7]), (float(x[8]), float(x[9]))
+
+
+def _nll_split_vec(x):
+    fr, a_mu, b_mu, mi_R_coeffs = _unpack_10(x)
+    return compute_global_nll_soft(fr, T=MU0_TEMP, a_mu=a_mu, b_mu=b_mu,
+                                   mi_R_coeffs=mi_R_coeffs)
+
+
+# Warm-start: 8p result + m_i_R initialised symmetric (= m_i from 8p fit)
+a_mi_ext, b_mi_ext = fit_results_ext["m_i"]
+x0_10 = _pack_10(fit_results_ext, a_mu_opt, b_mu_opt,
+                 (a_mi_ext, b_mi_ext))
+
+bounds_10 = [(None, None)] * 6 + [(5.0, 30.0), (1.0, 15.0)] + [(None, None)] * 2
+
+opt_10 = minimize(
+    _nll_split_vec,
+    x0_10,
+    method="L-BFGS-B",
+    bounds=bounds_10,
+    options={"maxiter": 10_000, "ftol": 1e-12, "gtol": 1e-8},
+)
+
+fit_results_10, a_mu_10, b_mu_10, mi_R_10 = _unpack_10(opt_10.x)
+
+nll_10_obj  = compute_global_nll_soft(fit_results_10, a_mu=a_mu_10, b_mu=b_mu_10,
+                                      mi_R_coeffs=mi_R_10)
+nll_10_hard = compute_global_nll(fit_results_10, a_mu=a_mu_10, b_mu=b_mu_10,
+                                 mi_R_coeffs=mi_R_10)
+
+print(f"L-BFGS-B (10-param) converged: {opt_10.success}  ({opt_10.message})")
+print(f"  Iterations: {opt_10.nit}   Function evaluations: {opt_10.nfev}")
+print(f"\n  Universal path:  a_mu = {a_mu_10:.4f}°  b_mu = {b_mu_10:.4f} yr")
+
+a_mi_R_10, b_mi_R_10 = mi_R_10
+print(f"\n  Amplitude relationships:")
+print(f"  {'param':8s}  {'slope 8p':>10s}  {'slope 10p':>10s}    {'int 8p':>8s}  {'int 10p':>8s}")
+for key in ("mu0", "mu_peak", "m_i"):
+    a8, b8   = fit_results_ext[key]
+    a10, b10 = fit_results_10[key]
+    print(f"  {key:8s}  {a8:>10.6f}  {a10:>10.6f}    {b8:>8.3f}  {b10:>8.3f}")
+print(f"  {'m_i_R':8s}  {a_mi_ext:>10.6f}  {a_mi_R_10:>10.6f}    "
+      f"{b_mi_ext:>8.3f}  {b_mi_R_10:>8.3f}  ← equatorward spread")
+
+# ── Scatter plots: m_i vs m_i_R amplitude relationships ──────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+for ax, (col, ylabel, color) in zip(axes, param_info):
+    vals = df19[["amplitude", col]].dropna()
+    x, y = vals["amplitude"].values, vals[col].values
+    amp_g = np.linspace(x.min() * 0.9, x.max() * 1.05, 200)
+
+    ax.scatter(x, y, color=color, s=40, alpha=0.80, edgecolors="none", zorder=3)
+
+    a8, b8   = fit_results_ext[col]
+    a10, b10 = fit_results_10[col]
+    ax.plot(amp_g, linear_fit(amp_g, a8,  b8),  color="tab:green", linewidth=2,
+            linestyle=":", label=f"8p  {a8:.5f}·A + {b8:.2f}")
+    ax.plot(amp_g, linear_fit(amp_g, a10, b10), color="tab:purple", linewidth=2,
+            linestyle="-", label=f"10p {a10:.5f}·A + {b10:.2f}")
+    if col == "m_i":
+        ax.plot(amp_g, linear_fit(amp_g, a_mi_R_10, b_mi_R_10),
+                color="tab:orange", linewidth=2, linestyle="--",
+                label=f"10p m_i_R {a_mi_R_10:.5f}·A + {b_mi_R_10:.2f}")
+
+    for _, row in df19.iterrows():
+        if pd.notna(row["amplitude"]) and pd.notna(row[col]):
+            ax.annotate(f"{int(row['cycle'])}{row['hemisphere'][0].upper()}",
+                        (row["amplitude"], row[col]),
+                        fontsize=5.5, alpha=0.55, xytext=(2, 2),
+                        textcoords="offset points")
+
+    ax.set_xlabel("Peak amplitude (MSH)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{col} vs amplitude")
+    ax.legend(fontsize=6)
+
+plt.suptitle(
+    f"10-param: Split-Gaussian + Soft μ₀ + universal path  "
+    f"(a_mu={a_mu_10:.3f}°, b_mu={b_mu_10:.3f} yr)\n"
+    f"m_i (poleward σ_L) vs m_i_R (equatorward σ_R) — rightmost panel shows both",
+    fontsize=11, y=1.02,
+)
+plt.tight_layout()
+plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Model Quality Scoreboard
 # ══════════════════════════════════════════════════════════════════════════
+#
+# NLL values differ along two independent axes:
+#
+# METRIC AXIS — how years near the cycle boundary are handled
+# ─────────────────────────────────────────────────────────────────────────
+#   hard  (compute_global_nll)
+#         Binary cutoff: years with μ > μ₀ are dropped entirely; the rest
+#         contribute equally.  This is the SCOREBOARD CURRENCY — all model
+#         rows are evaluated with it so they are directly comparable.
+#
+#   soft  (compute_global_nll_soft)
+#         Sigmoid weight w = 1/(1+exp((μ−μ₀)/T)), T=1°.  Every year
+#         contributes, but pre-cycle years (μ >> μ₀) are down-weighted to
+#         ≈ 0.  Normalised by Σw instead of a count.  This is what L-BFGS-B
+#         actually minimised, so soft models score best on this metric.
+#
+# MODEL AXIS — parameters optimised end-to-end
+# ─────────────────────────────────────────────────────────────────────────
+#   6p   6 amplitude-relationship coefficients; path fixed.
+#   8p   same 6 + a_mu/b_mu of the universal mean path.
+#   10p  same 8 + split-Gaussian: m_i_R(A) for equatorward spread σ_R.
+#        σ_L (poleward, x≥μ) ← m_i;  σ_R (equatorward, x<μ) ← m_i_R.
+#        log p = log(√(2/π)/(σ_L+σ_R)) − ½((x−μ)/σ_{L or R})²
+#
+# SUMMARY TABLE
+# ─────────────────────────────────────────────────────────────────────────
+#             hard metric (scoreboard)   soft metric (objective)
+#   6p        nll_soft_hard              nll_soft_obj  ← minimised
+#   8p        nll_ext_hard               nll_ext_obj   ← minimised
+#   10p       nll_10_hard                nll_10_obj    ← minimised
+#
+# Interpretation:
+#   nll_Xp_hard < nll_{X-2}p_hard → extra parameters genuinely help
+#   nll_Xp_hard ≈ nll_{X-2}p_hard → diminishing returns; simpler is better
+#   nll_soft_obj < nll_soft_hard   → expected: sigmoid normalisation assigns
+#                                    lower cost than the hard count
+# ══════════════════════════════════════════════════════════════════════════
+
 nll_23_hard = compute_global_nll(fit_results_23)
 
-pct_23   = (nll_baseline - nll_23_hard)   / abs(nll_baseline) * 100
+pct_23   = (nll_baseline - nll_23_hard)  / abs(nll_baseline) * 100
 pct_soft = (nll_baseline - nll_soft_hard) / abs(nll_baseline) * 100
+pct_ext  = (nll_baseline - nll_ext_hard)  / abs(nll_baseline) * 100
+pct_10   = (nll_baseline - nll_10_hard)   / abs(nll_baseline) * 100
 
-print("\n" + "=" * 65)
-print("  Model Quality Scoreboard  (hard-threshold NLL, nats/year)")
-print("=" * 65)
-print(f"  Baseline (Task 19 two-stage)          : {nll_baseline:.5f}")
-print(f"  Task 23  (hard cutoff, Nelder-Mead)   : {nll_23_hard:.5f}"
-      f"  ({pct_23:+.2f}%)")
-print(f"  Soft μ₀ T={MU0_TEMP}°  (L-BFGS-B)          : {nll_soft_hard:.5f}"
-      f"  ({pct_soft:+.2f}%)")
-print("-" * 65)
-print(f"  Soft model on its own metric          : {nll_soft_obj:.5f}"
-      f"  (sigmoid-weighted NLL)")
-print("=" * 65)
+print("\n" + "=" * 70)
+print("  Model Quality Scoreboard")
+print("=" * 70)
+print("  METRIC — hard: binary μ>μ₀ cutoff, equal-weight mean NLL")
+print(f"           soft: sigmoid w=1/(1+exp((μ−μ₀)/{MU0_TEMP}°)), Σw-normalised")
+print()
+print("  MODEL  — 6p:  6 amplitude coefficients; path fixed")
+print("           8p:  + a_mu/b_mu (universal mean path)")
+print("           10p: + m_i_R (split-Gaussian equatorward spread)")
+print()
+print(f"  {'Model':<44s}  {'hard NLL':>10s}  {'vs baseline':>12s}")
+print(f"  {'-'*44}  {'-'*10}  {'-'*12}")
+print(f"  {'Baseline (Task 19, two-stage)':<44s}  {nll_baseline:>10.5f}  {'—':>12s}")
+print(f"  {'Task 23  (hard cutoff, Nelder-Mead, 6p)':<44s}  {nll_23_hard:>10.5f}  {pct_23:>+11.2f}%")
+print(f"  {f'Soft μ₀ T={MU0_TEMP}° (L-BFGS-B, 6p)':<44s}  {nll_soft_hard:>10.5f}  {pct_soft:>+11.2f}%")
+print(f"  {'Soft μ₀ + path (L-BFGS-B, 8p)':<44s}  {nll_ext_hard:>10.5f}  {pct_ext:>+11.2f}%")
+print(f"  {'Split-Gaussian + path (L-BFGS-B, 10p)':<44s}  {nll_10_hard:>10.5f}  {pct_10:>+11.2f}%")
+print()
+print(f"  {'Model':<44s}  {'soft NLL':>10s}  {'note':>14s}")
+print(f"  {'-'*44}  {'-'*10}  {'-'*14}")
+print(f"  {'Soft μ₀  (6p) — what L-BFGS-B minimised':<44s}  {nll_soft_obj:>10.5f}  {'← 6p objective':>14s}")
+print(f"  {'Soft+path (8p) — what L-BFGS-B minimised':<44s}  {nll_ext_obj:>10.5f}  {'← 8p objective':>14s}")
+print(f"  {'Split+path (10p) — what L-BFGS-B minimised':<44s}  {nll_10_obj:>10.5f}  {'← 10p objective':>14s}")
+print("=" * 70)
