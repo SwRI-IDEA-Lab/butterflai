@@ -710,7 +710,7 @@ def compute_global_nll(fit_results, m_sh=None, b_sh=None, a_mu=None, b_mu=None,
             else:
                 total -= sp_norm.logpdf(lats, loc=mu, scale=sigma_L).mean()
             n_terms += 1
-    return total / max(n_terms, 1)
+    return total / n_terms if n_terms > 0 else 1e6
 
 
 MU0_TEMP = 1.0  # sigmoid temperature T (degrees) for the soft μ₀ threshold
@@ -781,7 +781,7 @@ def compute_global_nll_soft(fit_results, T=MU0_TEMP, m_sh=None, b_sh=None,
             else:
                 total_w -= w * sp_norm.logpdf(lats, loc=mu, scale=sigma_L).mean()
             sum_w += w
-    return total_w / max(sum_w, 1e-10)
+    return total_w / sum_w if sum_w > 1e-6 else 1e6
 
 
 nll_baseline = compute_global_nll(fit_results_19)
@@ -956,6 +956,122 @@ for ax, (col, ylabel, color) in zip(axes, param_info):
 
 plt.suptitle(
     f"Soft μ₀ threshold (T = {MU0_TEMP}°) + L-BFGS-B vs prior strategies",
+    fontsize=12, y=1.01,
+)
+plt.tight_layout()
+plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Soft μ₀ + Equatorial Line (m_shared, b_shared) — L-BFGS-B, 8 parameters
+# ══════════════════════════════════════════════════════════════════════════
+# Extend the 6-param soft model by also optimising the two universal
+# equatorial-line parameters m_shared and b_shared.  In Section 5 these
+# were fixed by a two-stage LSQ fit on binned (μ, σ) points; freeing them
+# lets the global NLL adjust the baseline σ(μ) jointly with all amplitude
+# relationships rather than treating it as a pre-fitted constant.
+#
+# Parameter vector layout (8 total):
+#   [a_mu0, b_mu0, a_mupeak, b_mupeak, a_mi, b_mi, m_shared, b_shared]
+#    0      1      2         3         4     5     6          7
+
+print(f"\nSoft μ₀ + equatorial line (8-param eq) L-BFGS-B (T = {MU0_TEMP}°) ...")
+
+
+def _pack_eq8(fr, m_sh, b_sh):
+    return np.array([
+        fr["mu0"][0],     fr["mu0"][1],
+        fr["mu_peak"][0], fr["mu_peak"][1],
+        fr["m_i"][0],     fr["m_i"][1],
+        m_sh, b_sh,
+    ])
+
+
+def _unpack_eq8(x):
+    fr = {
+        "mu0":     (x[0], x[1]),
+        "mu_peak": (x[2], x[3]),
+        "m_i":     (x[4], x[5]),
+    }
+    return fr, float(x[6]), float(x[7])
+
+
+def _nll_soft_eq8_vec(x):
+    fr, m_sh, b_sh = _unpack_eq8(x)
+    return compute_global_nll_soft(fr, T=MU0_TEMP, m_sh=m_sh, b_sh=b_sh)
+
+
+x0_eq8     = _pack_eq8(fit_results_soft, m_shared_fit, b_shared_fit)
+# m_shared > 0: spread must increase with mean latitude; b_shared weakly bounded
+bounds_eq8 = [(None, None)] * 6 + [(0.0, 2.0), (-5.0, 5.0)]
+
+opt_eq8 = minimize(
+    _nll_soft_eq8_vec,
+    x0_eq8,
+    method="L-BFGS-B",
+    bounds=bounds_eq8,
+    options={"maxiter": 10_000, "ftol": 1e-12, "gtol": 1e-8},
+)
+
+fit_results_eq8, m_shared_eq8, b_shared_eq8 = _unpack_eq8(opt_eq8.x)
+
+nll_eq8_obj  = compute_global_nll_soft(fit_results_eq8, m_sh=m_shared_eq8, b_sh=b_shared_eq8)
+nll_eq8_hard = compute_global_nll(fit_results_eq8, m_sh=m_shared_eq8, b_sh=b_shared_eq8)
+
+print(f"L-BFGS-B (eq8) converged: {opt_eq8.success}  ({opt_eq8.message})")
+print(f"  Iterations: {opt_eq8.nit}   Function evaluations: {opt_eq8.nfev}")
+print(f"\n  Optimised equatorial line:  m_shared = {m_shared_eq8:.4f}  (was {m_shared_fit:.4f})")
+print(f"                              b_shared = {b_shared_eq8:.4f}  (was {b_shared_fit:.4f})")
+print(f"  Zero crossing at μ = {-b_shared_eq8 / m_shared_eq8:.2f}°"
+      f"  (was {-b_shared_fit / m_shared_fit:.2f}°)")
+
+print("\nAmplitude-relationship coefficients  [eq8 vs prior strategies]:")
+print(f"  {'param':8s}  {'slope 19':>10s}  {'slope 23':>10s}  "
+      f"{'slope soft':>10s}  {'slope eq8':>10s}  "
+      f"  {'int 19':>7s}  {'int 23':>7s}  {'int soft':>8s}  {'int eq8':>8s}")
+for key in ("mu0", "mu_peak", "m_i"):
+    a19, b19 = fit_results_19[key]
+    a23, b23 = fit_results_23[key]
+    asf, bsf = fit_results_soft[key]
+    aeq, beq = fit_results_eq8[key]
+    print(f"  {key:8s}  {a19:>10.6f}  {a23:>10.6f}  {asf:>10.6f}  {aeq:>10.6f}  "
+          f"  {b19:>7.3f}  {b23:>7.3f}  {bsf:>8.3f}  {beq:>8.3f}")
+
+# ── Scatter plots: amplitude relationships ────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+for ax, (col, ylabel, color) in zip(axes, param_info):
+    vals = df19[["amplitude", col]].dropna()
+    x, y = vals["amplitude"].values, vals[col].values
+    amp_g = np.linspace(x.min() * 0.9, x.max() * 1.05, 200)
+
+    ax.scatter(x, y, color=color, s=40, alpha=0.80, edgecolors="none", zorder=3)
+
+    for (fr, lbl, ls, lc) in [
+        (fit_results_19,   "Task 19",       "--", "black"),
+        (fit_results_23,   "Task 23 (NM)",  "-",  "tab:red"),
+        (fit_results_soft, "Soft 6p",       "-.", "tab:blue"),
+        (fit_results_eq8,  "Soft 8p (eq)",  ":",  "tab:green"),
+    ]:
+        a, b = fr[col]
+        ax.plot(amp_g, linear_fit(amp_g, a, b), color=lc, linewidth=2,
+                linestyle=ls, label=f"{lbl}  {a:.5f}·A + {b:.2f}")
+
+    for _, row in df19.iterrows():
+        if pd.notna(row["amplitude"]) and pd.notna(row[col]):
+            ax.annotate(f"{int(row['cycle'])}{row['hemisphere'][0].upper()}",
+                        (row["amplitude"], row[col]),
+                        fontsize=5.5, alpha=0.55, xytext=(2, 2),
+                        textcoords="offset points")
+
+    ax.set_xlabel("Peak amplitude (MSH)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{col} vs amplitude")
+    ax.legend(fontsize=6)
+
+plt.suptitle(
+    f"8p (eq. line): Soft μ₀ + m_shared/b_shared  "
+    f"(m={m_shared_eq8:.4f}, b={b_shared_eq8:.4f})",
     fontsize=12, y=1.01,
 )
 plt.tight_layout()
@@ -1203,6 +1319,142 @@ plt.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Full Model — All Free Parameters — L-BFGS-B, 12 parameters
+# ══════════════════════════════════════════════════════════════════════════
+# Combine every parameter touched by any prior experiment into a single
+# joint optimisation:
+#   • 6 amplitude-relationship coefficients       (Task 23 / soft 6p)
+#   • m_shared, b_shared  (universal eq. line)    (8p eq)
+#   • a_mu, b_mu          (universal mean path)   (8p path)
+#   • a_mi_R, b_mi_R      (split-Gaussian σ_R)    (10p)
+#
+# Warm-started from the 10p result for the bulk + m_shared_eq8/b_shared_eq8
+# for the equatorial line (the two separately optimised 8p variants meet here).
+#
+# Parameter vector layout (12 total):
+#   [a_mu0, b_mu0, a_mupeak, b_mupeak, a_mi, b_mi,
+#    m_shared, b_shared, a_mu, b_mu, a_mi_R, b_mi_R]
+#    0       1      2       3      4    5
+#    6        7       8     9     10      11
+
+print(f"\nFull model (12-param) L-BFGS-B (T = {MU0_TEMP}°) ...")
+
+
+def _pack_12(fr, m_sh, b_sh, a_mu, b_mu, mi_R_coeffs):
+    return np.array([
+        fr["mu0"][0],     fr["mu0"][1],
+        fr["mu_peak"][0], fr["mu_peak"][1],
+        fr["m_i"][0],     fr["m_i"][1],
+        m_sh, b_sh,
+        a_mu, b_mu,
+        mi_R_coeffs[0],   mi_R_coeffs[1],
+    ])
+
+
+def _unpack_12(x):
+    fr = {
+        "mu0":     (x[0], x[1]),
+        "mu_peak": (x[2], x[3]),
+        "m_i":     (x[4], x[5]),
+    }
+    return (fr, float(x[6]), float(x[7]),
+            float(x[8]), float(x[9]),
+            (float(x[10]), float(x[11])))
+
+
+def _nll_full_12_vec(x):
+    fr, m_sh, b_sh, a_mu, b_mu, mi_R_coeffs = _unpack_12(x)
+    return compute_global_nll_soft(fr, T=MU0_TEMP, m_sh=m_sh, b_sh=b_sh,
+                                   a_mu=a_mu, b_mu=b_mu, mi_R_coeffs=mi_R_coeffs)
+
+
+x0_12 = _pack_12(fit_results_10, m_shared_eq8, b_shared_eq8,
+                 a_mu_10, b_mu_10, mi_R_10)
+
+bounds_12 = (
+    [(None, None)] * 6            # amplitude relationship coefficients
+    + [(0.0, 2.0), (-5.0, 5.0)]   # m_shared ∈ [0,2], b_shared ∈ [-5,5]
+    + [(5.0, 30.0), (1.0, 15.0)]  # a_mu (°), b_mu (yr)
+    + [(None, None)] * 2          # a_mi_R, b_mi_R
+)
+
+opt_12 = minimize(
+    _nll_full_12_vec,
+    x0_12,
+    method="L-BFGS-B",
+    bounds=bounds_12,
+    options={"maxiter": 10_000, "ftol": 1e-12, "gtol": 1e-8},
+)
+
+fit_results_12, m_shared_12, b_shared_12, a_mu_12, b_mu_12, mi_R_12 = _unpack_12(opt_12.x)
+a_mi_R_12, b_mi_R_12 = mi_R_12
+
+nll_12_obj  = compute_global_nll_soft(fit_results_12, m_sh=m_shared_12, b_sh=b_shared_12,
+                                      a_mu=a_mu_12, b_mu=b_mu_12, mi_R_coeffs=mi_R_12)
+nll_12_hard = compute_global_nll(fit_results_12, m_sh=m_shared_12, b_sh=b_shared_12,
+                                 a_mu=a_mu_12, b_mu=b_mu_12, mi_R_coeffs=mi_R_12)
+
+print(f"L-BFGS-B (12p) converged: {opt_12.success}  ({opt_12.message})")
+print(f"  Iterations: {opt_12.nit}   Function evaluations: {opt_12.nfev}")
+print(f"\n  Universal path:    a_mu = {a_mu_12:.4f}°  b_mu = {b_mu_12:.4f} yr"
+      f"  (10p: {a_mu_10:.4f}°, {b_mu_10:.4f} yr)")
+print(f"  Equatorial line:   m_shared = {m_shared_12:.4f}  b_shared = {b_shared_12:.4f}"
+      f"  (eq8: {m_shared_eq8:.4f}, {b_shared_eq8:.4f})")
+print(f"  Zero crossing at μ = {-b_shared_12 / m_shared_12:.2f}°")
+
+a_mi_R_10, b_mi_R_10 = mi_R_10
+print(f"\n  {'param':8s}  {'slope 10p':>10s}  {'slope 12p':>10s}    {'int 10p':>8s}  {'int 12p':>8s}")
+for key in ("mu0", "mu_peak", "m_i"):
+    a10, b10 = fit_results_10[key]
+    a12, b12 = fit_results_12[key]
+    print(f"  {key:8s}  {a10:>10.6f}  {a12:>10.6f}    {b10:>8.3f}  {b12:>8.3f}")
+print(f"  {'m_i_R':8s}  {a_mi_R_10:>10.6f}  {a_mi_R_12:>10.6f}    {b_mi_R_10:>8.3f}  {b_mi_R_12:>8.3f}"
+      "  ← equatorward spread")
+
+# ── Scatter plots: all strategies ────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+for ax, (col, ylabel, color) in zip(axes, param_info):
+    vals = df19[["amplitude", col]].dropna()
+    x, y = vals["amplitude"].values, vals[col].values
+    amp_g = np.linspace(x.min() * 0.9, x.max() * 1.05, 200)
+
+    ax.scatter(x, y, color=color, s=40, alpha=0.80, edgecolors="none", zorder=3)
+
+    for (fr, lbl, ls, lc, lw) in [
+        (fit_results_19,   "Task 19",        "--",         "black",      1.5),
+        (fit_results_23,   "Task 23 (NM)",   "-",          "tab:red",    1.5),
+        (fit_results_soft, "Soft 6p",        "-.",         "tab:blue",   1.5),
+        (fit_results_eq8,  "Soft 8p (eq)",   ":",          "tab:green",  1.5),
+        (fit_results_12,   "Full 12p",       (0, (5, 1)),  "tab:purple", 2.5),
+    ]:
+        a, b = fr[col]
+        ax.plot(amp_g, linear_fit(amp_g, a, b), color=lc, linewidth=lw,
+                linestyle=ls, label=f"{lbl}  {a:.5f}·A + {b:.2f}", zorder=4 if lw > 2 else 3)
+
+    for _, row in df19.iterrows():
+        if pd.notna(row["amplitude"]) and pd.notna(row[col]):
+            ax.annotate(f"{int(row['cycle'])}{row['hemisphere'][0].upper()}",
+                        (row["amplitude"], row[col]),
+                        fontsize=5.5, alpha=0.55, xytext=(2, 2),
+                        textcoords="offset points")
+
+    ax.set_xlabel("Peak amplitude (MSH)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{col} vs amplitude")
+    ax.legend(fontsize=6)
+
+plt.suptitle(
+    f"Full 12p: all free parameters  "
+    f"(a_mu={a_mu_12:.3f}°, b_mu={b_mu_12:.3f} yr, "
+    f"m_sh={m_shared_12:.4f}, b_sh={b_shared_12:.4f})",
+    fontsize=11, y=1.02,
+)
+plt.tight_layout()
+plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Model Quality Scoreboard
 # ══════════════════════════════════════════════════════════════════════════
 #
@@ -1245,10 +1497,12 @@ plt.show()
 
 nll_23_hard = compute_global_nll(fit_results_23)
 
-pct_23   = (nll_baseline - nll_23_hard)  / abs(nll_baseline) * 100
+pct_23   = (nll_baseline - nll_23_hard)   / abs(nll_baseline) * 100
 pct_soft = (nll_baseline - nll_soft_hard) / abs(nll_baseline) * 100
+pct_eq8  = (nll_baseline - nll_eq8_hard)  / abs(nll_baseline) * 100
 pct_ext  = (nll_baseline - nll_ext_hard)  / abs(nll_baseline) * 100
 pct_10   = (nll_baseline - nll_10_hard)   / abs(nll_baseline) * 100
+pct_12   = (nll_baseline - nll_12_hard)   / abs(nll_baseline) * 100
 
 print("\n" + "=" * 70)
 print("  Model Quality Scoreboard")
@@ -1256,21 +1510,31 @@ print("=" * 70)
 print("  METRIC — hard: binary μ>μ₀ cutoff, equal-weight mean NLL")
 print(f"           soft: sigmoid w=1/(1+exp((μ−μ₀)/{MU0_TEMP}°)), Σw-normalised")
 print()
-print("  MODEL  — 6p:  6 amplitude coefficients; path fixed")
-print("           8p:  + a_mu/b_mu (universal mean path)")
-print("           10p: + m_i_R (split-Gaussian equatorward spread)")
+print("  MODEL  — 6p:       6 amplitude coefficients; equatorial line and path fixed")
+print("           8p (eq): + m_shared/b_shared (universal equatorial line)")
+print("           8p:      + a_mu/b_mu (universal mean path)")
+print("           10p:     + m_i_R (split-Gaussian equatorward spread)")
+print("           12p:     all of the above jointly")
 print()
 print(f"  {'Model':<44s}  {'hard NLL':>10s}  {'vs baseline':>12s}")
 print(f"  {'-'*44}  {'-'*10}  {'-'*12}")
 print(f"  {'Baseline (Task 19, two-stage)':<44s}  {nll_baseline:>10.5f}  {'—':>12s}")
 print(f"  {'Task 23  (hard cutoff, Nelder-Mead, 6p)':<44s}  {nll_23_hard:>10.5f}  {pct_23:>+11.2f}%")
 print(f"  {f'Soft μ₀ T={MU0_TEMP}° (L-BFGS-B, 6p)':<44s}  {nll_soft_hard:>10.5f}  {pct_soft:>+11.2f}%")
+print(f"  {'Soft μ₀ + eq. line (L-BFGS-B, 8p eq)':<44s}  {nll_eq8_hard:>10.5f}  {pct_eq8:>+11.2f}%")
 print(f"  {'Soft μ₀ + path (L-BFGS-B, 8p)':<44s}  {nll_ext_hard:>10.5f}  {pct_ext:>+11.2f}%")
 print(f"  {'Split-Gaussian + path (L-BFGS-B, 10p)':<44s}  {nll_10_hard:>10.5f}  {pct_10:>+11.2f}%")
+print(f"  {'─ ' * 33}")
+print(f"  {'Full model (all params, L-BFGS-B, 12p)':<44s}  {nll_12_hard:>10.5f}  {pct_12:>+11.2f}%")
+print(f"  {'─ ' * 33}")
 print()
 print(f"  {'Model':<44s}  {'soft NLL':>10s}  {'note':>14s}")
 print(f"  {'-'*44}  {'-'*10}  {'-'*14}")
-print(f"  {'Soft μ₀  (6p) — what L-BFGS-B minimised':<44s}  {nll_soft_obj:>10.5f}  {'← 6p objective':>14s}")
-print(f"  {'Soft+path (8p) — what L-BFGS-B minimised':<44s}  {nll_ext_obj:>10.5f}  {'← 8p objective':>14s}")
-print(f"  {'Split+path (10p) — what L-BFGS-B minimised':<44s}  {nll_10_obj:>10.5f}  {'← 10p objective':>14s}")
+print(f"  {'Soft μ₀  (6p) — what L-BFGS-B minimised':<44s}  {nll_soft_obj:>10.5f}  {'← 6p objective':>18s}")
+print(f"  {'Soft+eq. line (8p eq) — minimised':<44s}  {nll_eq8_obj:>10.5f}  {'← 8p(eq) objective':>18s}")
+print(f"  {'Soft+path (8p) — what L-BFGS-B minimised':<44s}  {nll_ext_obj:>10.5f}  {'← 8p objective':>18s}")
+print(f"  {'Split+path (10p) — what L-BFGS-B minimised':<44s}  {nll_10_obj:>10.5f}  {'← 10p objective':>18s}")
+print(f"  {'─ ' * 33}")
+print(f"  {'Full model (12p) — what L-BFGS-B minimised':<44s}  {nll_12_obj:>10.5f}  {'← 12p objective':>18s}")
+print(f"  {'─ ' * 33}")
 print("=" * 70)
