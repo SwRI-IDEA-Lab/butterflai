@@ -42,6 +42,15 @@ from scipy.optimize import curve_fit, minimize_scalar, minimize
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH = REPO_ROOT / "data" / "composite_sunspot_groups_peak_area.csv"
 
+# ── Fitting mode ───────────────────────────────────────────────────────────
+# True  → match notebook 06 exactly:
+#           • amplitude smoothing uses correctedArea > 50 MSH
+#           • σ(μ) curve_fit is unbounded; validity requires sL, sR < 20°
+# False → broader settings that retain more cycles:
+#           • amplitude smoothing uses correctedArea > 30 MSH (same as lat data)
+#           • σ(μ) curve_fit uses explicit bounds; validity allows sL ≤ 100°, sR ≤ 40°
+MATCH_NOTEBOOK: bool = False
+
 # Dividing amplitudes by A_REF keeps all slope coefficients O(1),
 # preventing L-BFGS-B finite-difference gradients from drowning in noise.
 A_REF: float = 1000.0
@@ -618,15 +627,21 @@ def main() -> None:
                 drop_s4[(int(cyc), hemi)] = f"too few bins ({len(bm_arr)})"
                 continue
             try:
-                p0      = [bs_arr.max(), bm_arr[np.argmax(bs_arr)], 5.0, 4.0]
-                popt, _ = curve_fit(split_normal_amplitude, bm_arr, bs_arr,
-                                    p0=p0, maxfev=10_000)
+                p0 = [bs_arr.max(), bm_arr[np.argmax(bs_arr)], 5.0, 4.0]
+                if MATCH_NOTEBOOK:
+                    popt, _ = curve_fit(split_normal_amplitude, bm_arr, bs_arr,
+                                        p0=p0, maxfev=10_000)
+                else:
+                    _bounds = ([0.5, 2.0, 0.5, 0.5], [20.0, 38.0, 100.0, 40.0])
+                    popt, _ = curve_fit(split_normal_amplitude, bm_arr, bs_arr,
+                                        p0=p0, bounds=_bounds, maxfev=10_000)
                 A_f, mu_peak_f, sL_f, sR_f = popt
             except RuntimeError:
                 drop_s4[(int(cyc), hemi)] = "curve_fit failed"
                 continue
+            sL_max, sR_max = (20.0, 20.0) if MATCH_NOTEBOOK else (100.0, 40.0)
             if not (0.5 < A_f < 20 and 2 < mu_peak_f < 38
-                    and 0.5 < sL_f < 20 and 0.5 < sR_f < 20):
+                    and 0.5 < sL_f < sL_max and 0.5 < sR_f < sR_max):
                 drop_s4[(int(cyc), hemi)] = (
                     f"implausible  A={A_f:.2f} μpk={mu_peak_f:.2f} "
                     f"σL={sL_f:.2f} σR={sR_f:.2f}"
@@ -687,7 +702,7 @@ def main() -> None:
     # curve — matching that threshold here keeps amplitude values comparable.
     print("Computing cycle peak amplitudes ...")
     SMOOTHING_DAYS = 365
-    AMP_AREA_MIN   = 50.0
+    AMP_AREA_MIN   = 50.0 if MATCH_NOTEBOOK else 30.0
     df_amp = df[(df["CYCLE"].isin(cycles_13)) & (df["correctedArea"] > AMP_AREA_MIN)].copy()
 
     daily_north = df_amp[df_amp["hemisphere"] == "north"].groupby("date")["correctedArea"].sum()
