@@ -11,31 +11,43 @@ Methodology
 -----------
 1. Run the full S1 → S2 → S3 pipeline on ALL hemicycles (no held-out fold).
    This produces the point estimates.
-2. Bootstrap resampling of hemicycles WITH REPLACEMENT.  N_BOOTSTRAP draws,
-   each draws N_hemicycles hemicycles with replacement, refits the entire
-   pipeline (single restart per stage to keep runtime bounded), records all
-   parameters.
+2. Bootstrap by m-out-of-n subsampling (m = 0.95 n, without replacement).
+   Each draw refits the entire pipeline and records all parameters,
+   including per-hemicycle effective reference epochs.
 3. Reports per-parameter mean, std, median, and 2.5 / 97.5 percentile bounds.
 
-Why hemicycle-level bootstrap (not block-level): the hemicycle is the unit you
-want to generalise across — a future cycle the model has never seen.  Block-
-level resampling would underestimate uncertainty by treating each year-block
-as independent.
+Why hemicycle-level subsampling: the hemicycle is the unit you want to
+generalise across — a future cycle the model has never seen.  Block-level
+resampling would underestimate uncertainty by treating each year-block as
+independent.
+
+What the official model needs to be self-contained
+--------------------------------------------------
+The S1 mean-path fit refines each hemicycle's 15-degree crossing by δ_S1 to
+align it with the universal exponential decay.  The S3 NLL stage adds a
+further per-hemicycle correction Δt_S3.  The *effective* reference epoch
+the model uses is
+
+    t0_total = t0(15°-crossing) + δ_S1 + Δt_S3
+
+This is the single quantity downstream code needs — once it has t0_total
+for every fitted hemicycle, τ = decimal_year − t0_total feeds directly into
+μ(τ), σ(μ), and the Gaussian likelihood with no further fitting required.
+This script tracks all three components and reports t0_total alongside its
+bootstrap distribution.
 
 Outputs
 -------
-- model_specification.txt : human-readable parameter table with CIs and the
-  full LOCO-justified design rationale.
+- model_specification.txt : human-readable parameter table with CIs, the
+  full LOCO-justified design rationale, and the per-hemicycle t0_total
+  table (the table downstream users actually consume).
 - official_model.npz      : numpy archive containing the point estimates,
-  bootstrap distributions, and fold metadata for downstream use.
+  bootstrap distributions, fold metadata, and the per-hemicycle t0_total
+  arrays needed by butterflai_model.ButterflAIModel.
 - bootstrap_diagnostics.png : per-parameter histograms showing the bootstrap
   distributions and the point estimate.
 
-Runtime: ~30 minutes for N_BOOTSTRAP=200 on a modern laptop.  Variant Δt
-parameters are NOT bootstrapped because they are per-cycle quantities — when
-a cycle is sampled multiple times in a bootstrap draw, its Δt should be the
-same across copies.  The bootstrap reports global parameters and summary
-statistics over the per-cycle Δt's only.
+Runtime: ~30 minutes for N_BOOTSTRAP=200 on a modern laptop.
 """
 
 from __future__ import annotations
@@ -264,9 +276,10 @@ def prepare_data():
 def fit_pipeline(df, cycles_13, t0_lookup, amp_lookup, training_keys):
     """Run the full S1 → S2 → S3 fit on a given set of training keys.
 
-    Returns a dict with all fitted parameters and the cycle_data structure
-    used during NLL evaluation.  Returns None if the fold is infeasible
-    (insufficient data).
+    Returns a dict with all fitted parameters, the cycle_data structure
+    used during NLL evaluation, AND the t0_refined dict (so the caller
+    can compute t0_total = t0_refined + Δt_S3 per hemicycle).  Returns
+    None if the fold is infeasible (insufficient data).
     """
     # Section 3: universal mean path
     all_tau, all_mu = [], []
@@ -469,6 +482,7 @@ def fit_pipeline(df, cycles_13, t0_lookup, amp_lookup, training_keys):
         a_mu=a_mu_, b_mu=b_mu_,
         a_mu0=a_mu0_init, b_mu0=b_mu0_init,
         delta_t0s=dts,
+        t0_refined=t0_refined,        # NEW: dict {(cyc, hemi): refined epoch}
         hc_index=hc_index,
         nll_hard=nll_hard_val,
         coverage=det_hard["coverage"],
@@ -481,15 +495,18 @@ def fit_pipeline(df, cycles_13, t0_lookup, amp_lookup, training_keys):
 # ══════════════════════════════════════════════════════════════════════════
 
 def bootstrap_fit(df, cycles_13, t0_lookup, amp_lookup, all_keys, n_draws):
-    """N_BOOTSTRAP draws of resampled hemicycles with replacement.
+    """N_BOOTSTRAP draws of resampled hemicycles.
 
-    Each draw resamples N hemicycles WITH REPLACEMENT from the universe.
-    Duplicates contribute their cycle_data twice to the optimiser, which
-    correctly weights them.  The Δt for a duplicated cycle is fitted
-    independently for each occurrence — this is a peculiarity of bootstrap
-    + per-cycle parameters that we accept; it slightly inflates Δt
-    uncertainty but doesn't affect the global parameters that are the
-    main bootstrap target.
+    We use m-out-of-n subsampling without replacement (m = 0.95n) rather
+    than classical bootstrap-with-replacement, because some pipeline
+    components (per-cycle σ(μ) fits) are awkward to define when a cycle
+    appears in the draw multiple times.  The 95 % subsample produces
+    bootstrap-equivalent uncertainty estimates for the global parameters
+    that are our main target.
+
+    For per-hemicycle quantities (Δt_S3 and t0_total), each hemicycle is
+    sampled in ~95 % of draws — its bootstrap distribution is built from
+    those draws in which it was present.
     """
     rng = np.random.default_rng(BOOTSTRAP_SEED)
     universe = list(all_keys)
@@ -501,17 +518,12 @@ def bootstrap_fit(df, cycles_13, t0_lookup, amp_lookup, all_keys, n_draws):
                    "a_mu0", "b_mu0",
                    "nll_hard", "coverage"]
     samples = {k: [] for k in keys_global}
-    samples["dt_summary"] = []   # list of (mean, std) per draw — Δt fold-summary
+    samples["dt_summary"] = []   # (mean, std) of Δt's per draw — fold-summary
+    samples["t0_total"]   = {}   # NEW: {(cyc, hemi): [t0_total values across draws]}
 
     n_failed = 0
     for draw in range(n_draws):
-        # Resample WITH replacement.  `set()` collapses duplicates because
-        # fit_pipeline relies on dict-keyed lookups; to use duplicates we
-        # need to instead pass a list and modify the fitter — for the
-        # global parameters of interest, sampling without replacement
-        # (jackknife-style) over a 95-95 % subsample is equivalent and
-        # cleaner.  Here we sample WITHOUT replacement at fraction 0.95 to
-        # produce a proper bootstrap-of-uncorrelated-units approximation.
+        # m-out-of-n without replacement
         n_keep = int(round(0.95 * n_hemi))
         idx = rng.choice(n_hemi, size=n_keep, replace=False)
         keys = set(universe[i] for i in idx)
@@ -525,6 +537,14 @@ def bootstrap_fit(df, cycles_13, t0_lookup, amp_lookup, all_keys, n_draws):
                 samples[k].append(fit[k])
             dts = np.asarray(fit["delta_t0s"])
             samples["dt_summary"].append((float(np.mean(dts)), float(np.std(dts))))
+
+            # Per-hemicycle t0_total = t0_refined (from THIS draw) + Δt_S3
+            t0_ref_draw = fit["t0_refined"]
+            for (cyc, hemi), dt in zip(fit["hc_index"], fit["delta_t0s"]):
+                key = (int(cyc), str(hemi))
+                t0_total_val = float(t0_ref_draw[(cyc, hemi)] + float(dt))
+                samples["t0_total"].setdefault(key, []).append(t0_total_val)
+
             if (draw + 1) % 20 == 0:
                 nll_so_far = np.array(samples["nll_hard"])
                 print(f"  draw {draw+1:3d}/{n_draws}  "
@@ -536,9 +556,12 @@ def bootstrap_fit(df, cycles_13, t0_lookup, amp_lookup, all_keys, n_draws):
                 print(f"  draw {draw+1}: failed ({e}); total failures={n_failed}")
 
     print(f"\nBootstrap completed: {n_draws - n_failed}/{n_draws} successful draws.")
-    return {k: np.array(v) for k, v in samples.items() if k != "dt_summary"} | {
-        "dt_summary": np.array(samples["dt_summary"]) if samples["dt_summary"] else np.zeros((0, 2)),
-    }
+    out = {k: np.array(v) for k, v in samples.items()
+           if k not in ("dt_summary", "t0_total")}
+    out["dt_summary"] = (np.array(samples["dt_summary"]) if samples["dt_summary"]
+                        else np.zeros((0, 2)))
+    out["t0_total"]   = samples["t0_total"]    # leave as dict for per-hc lookup
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -561,7 +584,38 @@ PARAM_DOCS = {
 }
 
 
-def write_specification(point_fit, samples):
+def summarize_t0_total(point_fit, samples_t0):
+    """Build per-hemicycle t0_total table aligned with the point fit's hc_index.
+
+    Returns a list of dicts with:
+      cycle, hemisphere, t0_15deg, t0_refined, t0_total (point),
+      boot_mean, boot_std, boot_lo, boot_hi, n_boot
+    """
+    rows = []
+    for (cyc, hemi), dt_pt in zip(point_fit["hc_index"], point_fit["delta_t0s"]):
+        key = (int(cyc), str(hemi))
+        t0_ref_pt = point_fit["t0_refined"][(cyc, hemi)]
+        t0_total_pt = t0_ref_pt + float(dt_pt)
+        boot_arr = np.array(samples_t0.get(key, []))
+        if boot_arr.size > 1:
+            boot_mean = float(boot_arr.mean())
+            boot_std  = float(boot_arr.std())
+            boot_lo, boot_hi = (float(x) for x in np.percentile(boot_arr, [2.5, 97.5]))
+        else:
+            boot_mean = boot_std = boot_lo = boot_hi = float("nan")
+        rows.append(dict(
+            cycle=int(cyc), hemisphere=str(hemi),
+            t0_refined=float(t0_ref_pt),
+            delta_t_S3=float(dt_pt),
+            t0_total=float(t0_total_pt),
+            boot_mean=boot_mean, boot_std=boot_std,
+            boot_lo=boot_lo, boot_hi=boot_hi,
+            n_boot=int(boot_arr.size),
+        ))
+    return rows
+
+
+def write_specification(point_fit, samples, t0_rows, t0_lookup):
     """Write a human-readable model specification with parameter CIs."""
     with open(OUT_SPEC, "w") as f:
         f.write("=" * 78 + "\n")
@@ -618,27 +672,55 @@ def write_specification(point_fit, samples):
                     f"{lo:>14.6f} {hi:>14.6f}  {desc} [{units}]\n")
         f.write("\n")
 
-        f.write("PER-HEMICYCLE TIMESHIFTS (point estimate only — not bootstrapped)\n")
-        f.write("-" * 78 + "\n")
-        for (cyc, hemi), dt in zip(point_fit["hc_index"], point_fit["delta_t0s"]):
-            flag = "BND" if abs(abs(dt) - 2.0) < 0.05 else ""
-            f.write(f"  cycle {cyc:>2d}  {hemi:<6s}  Δt = {dt:>+.4f} yr   {flag}\n")
-        f.write("\n")
-
-        f.write("USAGE\n")
-        f.write("-" * 78 + "\n")
+        f.write("PER-HEMICYCLE EFFECTIVE REFERENCE EPOCH  t0_total  (decimal year)\n")
+        f.write("=" * 78 + "\n")
         f.write(
-            "For a hemicycle with amplitude A (in MSH / 1000) and 15-degree\n"
-            "crossing t0:\n"
+            "This is the canonical quantity downstream code consumes.\n"
+            "  τ = decimal_year − t0_total  feeds μ(τ), σ(μ), and the Gaussian\n"
+            "  likelihood with no further fitting required.\n\n"
+            "Components:\n"
+            "  t0_15deg    — raw 15° crossing of yearly-mean |latitude|\n"
+            "  t0_refined  — t0_15deg + δ_S1 (S1 mean-path alignment)\n"
+            "  Δt_S3       — S3 NLL refinement\n"
+            "  t0_total    = t0_refined + Δt_S3   (THE deployment value)\n\n"
+        )
+        f.write(f"{'cyc':>4} {'hemi':<6} "
+                f"{'t0_15deg':>10} {'t0_refined':>12} {'Δt_S3':>9} "
+                f"{'t0_total':>12} {'boot_mean':>12} {'boot_std':>9} "
+                f"{'2.5 %':>10} {'97.5 %':>10} {'n_boot':>7}\n")
+        f.write("-" * 78 + "\n")
+        for r in t0_rows:
+            t0_raw = t0_lookup.get((r["cycle"], r["hemisphere"]), float("nan"))
+            flag   = " (BND)" if abs(abs(r["delta_t_S3"]) - 2.0) < 0.05 else ""
+            f.write(
+                f"{r['cycle']:>4d} {r['hemisphere']:<6s} "
+                f"{t0_raw:>10.4f} {r['t0_refined']:>12.4f} "
+                f"{r['delta_t_S3']:>+9.4f} "
+                f"{r['t0_total']:>12.4f} {r['boot_mean']:>12.4f} "
+                f"{r['boot_std']:>9.4f} {r['boot_lo']:>10.4f} "
+                f"{r['boot_hi']:>10.4f} {r['n_boot']:>7d}{flag}\n"
+            )
+        f.write("\n  (BND) marks Δt_S3 at the ±2 yr optimiser bound.\n\n")
+
+        f.write("USAGE — closed form, no re-fitting required\n")
+        f.write("=" * 78 + "\n")
+        f.write(
+            "For a hemicycle (cycle, hemisphere) with amplitude A (in MSH/1000):\n\n"
+            "  t0_total   = (look up in table above)\n"
+            "  τ          = decimal_year − t0_total                  [years]\n"
+            "  μ(τ)       = a_mu · exp(−τ / b_mu)                    [degrees]\n"
             "  μ_0(A)     = a_mu0     · A + b_mu0\n"
             "  μ_peak(A)  = a_mu_peak · A + b_mu_peak\n"
             "  m_i(A)     = a_m_i     · A + b_m_i\n"
-            "  μ(τ)       = a_mu · exp(−τ / b_mu)\n"
-            "  τ          = (t − t0) for new hemicycles (Δt unknown for unseen cycles)\n"
-            "  σ(μ)       = piecewise_linear_sigma(μ, m_shared, b_shared,\n"
-            "                                       μ_peak(A), m_i(A))\n"
-            "  Likelihood = N(latitude | μ(τ), σ(μ(τ)))   for μ(τ) ≤ μ_0(A)\n"
-            "             = 0                              for μ(τ) > μ_0(A)\n"
+            "  σ(μ, A)    = piecewise_linear_sigma(\n"
+            "                  μ, m_shared, b_shared, μ_peak(A), m_i(A))\n"
+            "  Active?    = (μ(τ) ≤ μ_0(A))\n"
+            "  p(|lat|)   = N(|lat| | μ(τ), σ(μ(τ), A))     when active\n"
+            "             = 0                                otherwise\n\n"
+            "For a NEW (unseen) hemicycle, t0_total is not in the table.\n"
+            "Use t0_15deg from the smoothed yearly-mean |latitude| crossing\n"
+            "of 15° as a proxy.  The Δt_S3 corrections are by construction\n"
+            "unidentifiable for held-out cycles.\n"
         )
     print(f"Wrote {OUT_SPEC}")
 
@@ -692,12 +774,29 @@ def main() -> None:
     samples = bootstrap_fit(df, cycles_13, t0_lookup, amp_lookup,
                             universe, N_BOOTSTRAP)
 
-    write_specification(point_fit, samples)
+    # Summarise per-hemicycle t0_total (point + bootstrap)
+    t0_rows = summarize_t0_total(point_fit, samples["t0_total"])
+
+    write_specification(point_fit, samples, t0_rows, t0_lookup)
     plot_bootstrap(point_fit, samples)
+
+    # Build parallel arrays for the npz (clean for downstream loading)
+    hc_cycles    = np.array([r["cycle"]      for r in t0_rows], dtype=int)
+    hc_hemis     = np.array([r["hemisphere"] for r in t0_rows])
+    t0_15deg_arr = np.array([t0_lookup[(r["cycle"], r["hemisphere"])]
+                             for r in t0_rows], dtype=float)
+    t0_refined_pt = np.array([r["t0_refined"]  for r in t0_rows], dtype=float)
+    delta_t_S3_pt = np.array([r["delta_t_S3"]  for r in t0_rows], dtype=float)
+    t0_total_pt   = np.array([r["t0_total"]    for r in t0_rows], dtype=float)
+    t0_total_mean = np.array([r["boot_mean"]   for r in t0_rows], dtype=float)
+    t0_total_std  = np.array([r["boot_std"]    for r in t0_rows], dtype=float)
+    t0_total_lo   = np.array([r["boot_lo"]     for r in t0_rows], dtype=float)
+    t0_total_hi   = np.array([r["boot_hi"]     for r in t0_rows], dtype=float)
+    t0_total_n    = np.array([r["n_boot"]      for r in t0_rows], dtype=int)
 
     np.savez(
         OUT_NPZ,
-        # Point estimates
+        # ── Global parameters: point estimates ─────────────────────────
         point_a_mu_peak=point_fit["a_mu_peak"],
         point_b_mu_peak=point_fit["b_mu_peak"],
         point_a_m_i=point_fit["a_m_i"],
@@ -710,9 +809,19 @@ def main() -> None:
         point_b_mu0=point_fit["b_mu0"],
         point_nll_hard=point_fit["nll_hard"],
         point_coverage=point_fit["coverage"],
-        point_delta_t0s=point_fit["delta_t0s"],
-        point_hc_index=np.array(point_fit["hc_index"], dtype=object),
-        # Bootstrap distributions
+        # ── Per-hemicycle effective reference epoch ────────────────────
+        hc_cycles=hc_cycles,
+        hc_hemispheres=hc_hemis,
+        point_t0_15deg=t0_15deg_arr,
+        point_t0_refined=t0_refined_pt,
+        point_delta_t_S3=delta_t_S3_pt,
+        point_t0_total=t0_total_pt,
+        boot_t0_total_mean=t0_total_mean,
+        boot_t0_total_std=t0_total_std,
+        boot_t0_total_lo=t0_total_lo,
+        boot_t0_total_hi=t0_total_hi,
+        boot_t0_total_n=t0_total_n,
+        # ── Bootstrap distributions of global parameters ───────────────
         boot_a_mu_peak=samples["a_mu_peak"],
         boot_b_mu_peak=samples["b_mu_peak"],
         boot_a_m_i=samples["a_m_i"],
@@ -728,8 +837,10 @@ def main() -> None:
         boot_dt_summary=samples["dt_summary"],
     )
     print(f"Wrote {OUT_NPZ}")
-    print("\nDone. Load downstream with:")
-    print(f"  d = np.load('{OUT_NPZ.name}', allow_pickle=True)")
+    print("\nDone.  Load downstream with:")
+    print(f"  from butterflai_model import ButterflAIModel")
+    print(f"  m = ButterflAIModel('{OUT_NPZ.name}')")
+    print(f"  mu, sigma = m.gaussian(amplitude=1.5, tau=2.0)")
 
 
 if __name__ == "__main__":
