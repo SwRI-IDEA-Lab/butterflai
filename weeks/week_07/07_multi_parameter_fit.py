@@ -42,6 +42,15 @@ from scipy.optimize import curve_fit, minimize_scalar, minimize
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH = REPO_ROOT / "data" / "composite_sunspot_groups_peak_area.csv"
 
+# ── Fitting mode ───────────────────────────────────────────────────────────
+# True  → match notebook 06 exactly:
+#           • amplitude smoothing uses correctedArea > 50 MSH
+#           • σ(μ) curve_fit is unbounded; validity requires sL, sR < 20°
+# False → broader settings that retain more cycles:
+#           • amplitude smoothing uses correctedArea > 30 MSH (same as lat data)
+#           • σ(μ) curve_fit uses explicit bounds; validity allows sL ≤ 100°, sR ≤ 40°
+MATCH_NOTEBOOK: bool = False
+
 # Dividing amplitudes by A_REF keeps all slope coefficients O(1),
 # preventing L-BFGS-B finite-difference gradients from drowning in noise.
 A_REF: float = 1000.0
@@ -309,6 +318,108 @@ def compute_nll_percycle(
     return total / n if n > 0.0 else 1e6
 
 
+def compute_nll_hard_gate(
+    cycle_data: list,
+    fit_results: dict,
+    m_shared: float,
+    b_shared: float,
+    a_mu: float,
+    b_mu: float,
+    a_mu0: float,
+    b_mu0: float,
+    delta_t0s: np.ndarray | None = None,
+) -> float:
+    """
+    NLL with a hard μ₀ gate — identical scoring to notebook 06's
+    ``compute_global_nll``.
+
+    Years where μ(τ) > μ₀(A) are excluded entirely (no sigmoid weighting).
+    Each surviving year-block counts as 1 in the normalisation denominator,
+    matching the notebook's ``n_terms`` accumulator.
+
+    Parameters
+    ----------
+    cycle_data  : list of (amplitude, t0_refined, [(year_center, lats), ...])
+    fit_results : dict — 'mu_peak' and 'm_i' as (slope, intercept) tuples
+    m_shared    : float — equatorward σ-line slope
+    b_shared    : float — equatorward σ-line intercept
+    a_mu        : float — mean-path amplitude  [degrees]
+    b_mu        : float — mean-path e-folding time  [years]
+    a_mu0       : float — slope of μ₀(A) = a_mu0·A + b_mu0
+    b_mu0       : float — intercept of μ₀(A)  [degrees]
+    delta_t0s   : ndarray shape (N_hc,) or None — per-cycle timeshift corrections
+
+    Returns
+    -------
+    float — mean NLL per block (nats).  Returns 1e6 if no valid blocks.
+    """
+    a_mupeak, b_mupeak = fit_results["mu_peak"]
+    a_mi,     b_mi     = fit_results["m_i"]
+    total, n = 0.0, 0.0
+
+    for i, (amplitude, t0_ref, year_blocks) in enumerate(cycle_data):
+        mu0_p    = a_mu0 * amplitude + b_mu0
+        mupeak_p = a_mupeak * amplitude + b_mupeak
+        mi_p     = a_mi     * amplitude + b_mi
+        dt       = float(delta_t0s[i]) if delta_t0s is not None else 0.0
+        t0_eff   = t0_ref + dt
+
+        for year_center, lats in year_blocks:
+            tau = year_center - t0_eff
+            mu  = a_mu * np.exp(-tau / b_mu)
+            if mu > mu0_p:
+                continue
+            sigma = piecewise_linear_sigma(mu, m_shared, b_shared, mupeak_p, mi_p)
+            if sigma <= 0.0:
+                continue
+            total -= sp_norm.logpdf(lats, loc=mu, scale=sigma).mean()
+            n     += 1.0
+
+    return total / n if n > 0.0 else 1e6
+
+
+def compute_nll_percycle_hard_gate(
+    cycle_data: list,
+    hc_index: list,
+    percycle_params: dict,
+    m_shared: float,
+    b_shared: float,
+    a_mu: float,
+    b_mu: float,
+) -> float:
+    """
+    Per-cycle baseline NLL with a hard μ₀ gate — notebook-06 scoring.
+
+    Parameters
+    ----------
+    cycle_data      : list of (amplitude, t0_refined, [(year_center, lats), ...])
+    hc_index        : list of (cycle, hemi) in the same order as cycle_data
+    percycle_params : dict mapping (cycle, hemi) → (mu_peak, m_i, mu0)
+    m_shared        : float — equatorward σ-line slope
+    b_shared        : float — equatorward σ-line intercept
+    a_mu            : float — mean-path amplitude  [degrees]
+    b_mu            : float — mean-path e-folding time  [years]
+
+    Returns
+    -------
+    float — mean NLL per block (nats).  Returns 1e6 if no valid blocks.
+    """
+    total, n = 0.0, 0.0
+    for i, (_, t0_ref, year_blocks) in enumerate(cycle_data):
+        mu_peak_i, mi_i, mu0_i = percycle_params[hc_index[i]]
+        for year_center, lats in year_blocks:
+            tau = year_center - t0_ref
+            mu  = a_mu * np.exp(-tau / b_mu)
+            if mu > mu0_i:
+                continue
+            sigma = piecewise_linear_sigma(mu, m_shared, b_shared, mu_peak_i, mi_i)
+            if sigma <= 0.0:
+                continue
+            total -= sp_norm.logpdf(lats, loc=mu, scale=sigma).mean()
+            n     += 1.0
+    return total / n if n > 0.0 else 1e6
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Section 4 — Data preparation helpers
 # ══════════════════════════════════════════════════════════════════════════
@@ -516,16 +627,21 @@ def main() -> None:
                 drop_s4[(int(cyc), hemi)] = f"too few bins ({len(bm_arr)})"
                 continue
             try:
-                p0      = [bs_arr.max(), bm_arr[np.argmax(bs_arr)], 5.0, 4.0]
-                _bounds = ([0.5, 2.0, 0.5, 0.5], [20.0, 38.0, 100.0, 40.0])
-                popt, _ = curve_fit(split_normal_amplitude, bm_arr, bs_arr,
-                                    p0=p0, bounds=_bounds, maxfev=10_000)
+                p0 = [bs_arr.max(), bm_arr[np.argmax(bs_arr)], 5.0, 4.0]
+                if MATCH_NOTEBOOK:
+                    popt, _ = curve_fit(split_normal_amplitude, bm_arr, bs_arr,
+                                        p0=p0, maxfev=10_000)
+                else:
+                    _bounds = ([0.5, 2.0, 0.5, 0.5], [20.0, 38.0, 100.0, 40.0])
+                    popt, _ = curve_fit(split_normal_amplitude, bm_arr, bs_arr,
+                                        p0=p0, bounds=_bounds, maxfev=10_000)
                 A_f, mu_peak_f, sL_f, sR_f = popt
             except RuntimeError:
                 drop_s4[(int(cyc), hemi)] = "curve_fit failed"
                 continue
+            sL_max, sR_max = (20.0, 20.0) if MATCH_NOTEBOOK else (100.0, 40.0)
             if not (0.5 < A_f < 20 and 2 < mu_peak_f < 38
-                    and 0.5 < sL_f <= 100 and 0.5 < sR_f <= 40):
+                    and 0.5 < sL_f < sL_max and 0.5 < sR_f < sR_max):
                 drop_s4[(int(cyc), hemi)] = (
                     f"implausible  A={A_f:.2f} μpk={mu_peak_f:.2f} "
                     f"σL={sL_f:.2f} σR={sR_f:.2f}"
@@ -582,9 +698,12 @@ def main() -> None:
         ))
 
     # ── 6. Cycle peak amplitudes ──────────────────────────────────────────
+    # Notebook 06 Task 17 uses correctedArea > 50 MSH for the smoothed activity
+    # curve — matching that threshold here keeps amplitude values comparable.
     print("Computing cycle peak amplitudes ...")
     SMOOTHING_DAYS = 365
-    df_amp = df[df["CYCLE"].isin(cycles_13)].copy()
+    AMP_AREA_MIN   = 50.0 if MATCH_NOTEBOOK else 30.0
+    df_amp = df[(df["CYCLE"].isin(cycles_13)) & (df["correctedArea"] > AMP_AREA_MIN)].copy()
 
     daily_north = df_amp[df_amp["hemisphere"] == "north"].groupby("date")["correctedArea"].sum()
     daily_south = df_amp[df_amp["hemisphere"] == "south"].groupby("date")["correctedArea"].sum()
@@ -698,8 +817,8 @@ def main() -> None:
     print(f"  {n_hc} hemisphere-cycles  |  {n_obs} total yearly blocks"
           f"  (μ₀ gate is soft sigmoid, T = {MU0_SIGMOID_T}°)")
 
-    # ── 8b. Baseline NLLs from notebook 06 procedural fits ───────────────
-    print("Computing procedural baselines (notebook 06) ...")
+    # ── 8b. Baseline NLLs ────────────────────────────────────────────────
+    print("Computing procedural baselines ...")
 
     # B0a: amplitude regression from Task 19 applied directly, no NLL optimisation
     nll_b0a = compute_nll(
@@ -709,7 +828,14 @@ def main() -> None:
         a_mu_univ, b_mu_univ,
         a_mu0_init, b_mu0_init,
     )
-    print(f"  B0a (amplitude regression, no NLL opt):  NLL = {nll_b0a:.5f}")
+    nll_b0a_nb = compute_nll_hard_gate(
+        cycle_data,
+        {"mu_peak": init_fit_results["mu_peak"], "m_i": init_fit_results["m_i"]},
+        m_shared_fit, b_shared_fit,
+        a_mu_univ, b_mu_univ,
+        a_mu0_init, b_mu0_init,
+    )
+    print(f"  B0a (amplitude regression, no NLL opt):  soft={nll_b0a:.5f}  hard={nll_b0a_nb:.5f}")
 
     # B0b: per-cycle mu_peak and m_i from the piecewise-linear joint fit (no regression)
     percycle_params = {
@@ -720,7 +846,11 @@ def main() -> None:
         cycle_data, hc_index, percycle_params,
         m_shared_fit, b_shared_fit, a_mu_univ, b_mu_univ,
     )
-    print(f"  B0b (per-cycle direct, no regression):   NLL = {nll_b0b:.5f}")
+    nll_b0b_nb = compute_nll_percycle_hard_gate(
+        cycle_data, hc_index, percycle_params,
+        m_shared_fit, b_shared_fit, a_mu_univ, b_mu_univ,
+    )
+    print(f"  B0b (per-cycle direct, no regression):   soft={nll_b0b:.5f}  hard={nll_b0b_nb:.5f}")
 
     # ── 9. Optimisation ───────────────────────────────────────────────────
     LBFGSB_OPTS = {"maxiter": 10_000, "ftol": 1e-12, "gtol": 1e-8}
@@ -813,18 +943,39 @@ def main() -> None:
     nll_s3 = opt_s3.fun
     print(f"  converged={opt_s3.success}  iters={opt_s3.nit}  NLL={nll_s3:.5f}")
 
-    # ── 10. Report results ────────────────────────────────────────────────
-    print("\n" + "=" * 65)
+    # ── 10. Evaluate all stages under the hard-gate metric (notebook 06 scoring) ──
+    nll_s1_nb = compute_nll_hard_gate(
+        cycle_data, fr_s1, m_sh_s1, b_sh_s1, a_mu_univ, b_mu_univ,
+        a_mu0_init, b_mu0_init,
+    )
+    nll_s2_nb = compute_nll_hard_gate(
+        cycle_data, fr_s2, m_sh_s2, b_sh_s2, a_mu_s2, b_mu_s2,
+        a_mu0_init, b_mu0_init,
+    )
+    nll_s3_nb = compute_nll_hard_gate(
+        cycle_data, fr_s3, m_sh_s3, b_sh_s3, a_mu_s3, b_mu_s3,
+        a_mu0_init, b_mu0_init, dts_s3,
+    )
+
+    # ── 11. Report results ────────────────────────────────────────────────
+    W = 50
+    print("\n" + "=" * (W + 28))
     print("  Optimisation Progression")
-    print("=" * 65)
-    print(f"  {'Stage':<50s}  {'NLL':>10s}")
-    print(f"  {'-'*50}  {'-'*10}")
-    print(f"  {'B0a: procedural — amplitude regression (Task 19)':<50s}  {nll_b0a:>10.5f}")
-    print(f"  {'B0b: procedural — per-cycle direct (no regression)':<50s}  {nll_b0b:>10.5f}")
-    print(f"  {'-'*50}  {'-'*10}")
-    print(f"  {'S1: 6p NM  (amplitude regression + eq. line)':<50s}  {nll_s1:>10.5f}")
-    print(f"  {'S2: 8p NM  (all global params)':<50s}  {nll_s2:>10.5f}")
-    print(f"  {f'S3: {8+n_hc}p LBFGSB  (global + timeshifts)':<50s}  {nll_s3:>10.5f}")
+    print("=" * (W + 28))
+    print(f"  {'Stage':<{W}s}  {'soft-gate':>10s}  {'hard-gate':>10s}")
+    print(f"  {'(this script)':<{W}s}  {'(notebook 06)':>10s}")
+    print(f"  {'-'*W}  {'-'*10}  {'-'*10}")
+    print(f"  {'B0a: procedural — amplitude regression (Task 19)':<{W}s}"
+          f"  {nll_b0a:>10.5f}  {nll_b0a_nb:>10.5f}")
+    print(f"  {'B0b: procedural — per-cycle direct (no regression)':<{W}s}"
+          f"  {nll_b0b:>10.5f}  {nll_b0b_nb:>10.5f}")
+    print(f"  {'-'*W}  {'-'*10}  {'-'*10}")
+    print(f"  {'S1: 6p NM  (amplitude regression + eq. line)':<{W}s}"
+          f"  {nll_s1:>10.5f}  {nll_s1_nb:>10.5f}")
+    print(f"  {'S2: 8p NM  (all global params)':<{W}s}"
+          f"  {nll_s2:>10.5f}  {nll_s2_nb:>10.5f}")
+    print(f"  {f'S3: {8+n_hc}p LBFGSB  (global + timeshifts)':<{W}s}"
+          f"  {nll_s3:>10.5f}  {nll_s3_nb:>10.5f}")
     print()
     print(f"  S3 converged={opt_s3.success}  iters={opt_s3.nit}")
     print()
@@ -846,7 +997,7 @@ def main() -> None:
         t0_i  = t0_refined[(cyc, hemi)]
         mu0_i = a_mu0_init * amp_i + b_mu0_init
         print(f"    {cyc:>6d}  {hemi:<6s}  {t0_i:>12.4f}  {dt:>+8.4f}  {t0_i + dt:>12.4f}  {mu0_i:>6.2f}°")
-    print("=" * 65)
+    print("=" * (W + 28))
 
 
 if __name__ == "__main__":
