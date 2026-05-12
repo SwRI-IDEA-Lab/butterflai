@@ -211,3 +211,6 @@ __marimo__/
 *.dat
 *.zip
 *.mat
+*.png
+*.json
+*.csv
