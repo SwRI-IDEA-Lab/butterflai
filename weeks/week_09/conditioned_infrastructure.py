@@ -16,7 +16,7 @@ conditioning introduces.
 
 Contents
 --------
-ConditionalResidualDataset       : clean residuals + normalized (A, mu) covariates.
+ConditionalResidualDataset       : clean residuals + normalized (area, mu) covariates.
 ConditionalDiffusionMLP          : (r_t, t, cond) → ε̂, raw input-concatenation.
 ConditionalDiffusionLightning    : training/validation with conditioning batches.
 sample_conditional               : DDIM sampler that accepts per-sample conditioning.
@@ -44,7 +44,7 @@ from unconditioned_infrastructure import (
 
 class ConditionalResidualDataset(torch.utils.data.Dataset):
     """Indexed clean residuals (hist_emp − hist_par) plus normalized
-    conditioning covariates (amplitude, mu_universal) for one split.
+    conditioning covariates (area_smoothed, mu_universal) for one split.
 
     `__getitem__(idx)` returns a **dictionary**:
 
@@ -88,7 +88,7 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
 
     HIST_COLS = [f"hist_emp_{j:02d}" for j in range(15)]
     PAR_COLS  = [f"hist_par_{j:02d}" for j in range(15)]
-    COND_COLS = ["amplitude", "mu_universal"]
+    COND_COLS = ["area_smoothed", "mu_universal"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
         # Tasks:
