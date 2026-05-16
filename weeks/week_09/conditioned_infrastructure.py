@@ -1,5 +1,5 @@
 """
-conditioned_models.py — ButterflAI Week 09 *conditional* diffusion machinery.
+conditioned_infrastructure.py — ButterflAI Week 09 *conditional* diffusion machinery.
 
 This script contains the new class and function *definitions* introduced in
 Week 09, in template form. Students fill in the bodies of `__init__`,
@@ -10,7 +10,7 @@ and `09d_conditioned_evaluate.ipynb` specify the contract for each.
 Everything that does not change between the unconditional and conditional
 pipelines — the cosine schedule, the sinusoidal timestep embedding, the
 TimestepEmbedding wrapper module, the SampleQualityCallback — is imported
-unchanged from `unconditioned_models.py` rather than re-implemented here.
+unchanged from `unconditioned_infrastructure.py` rather than re-implemented here.
 This is deliberate: the only differences worth seeing are the differences
 conditioning introduces.
 
@@ -33,7 +33,7 @@ from einops import rearrange
 import pytorch_lightning as pl
 
 # Reuse Week 08 machinery unchanged — conditioning does not affect any of these.
-from unconditioned_models import (
+from unconditioned_infrastructure import (
     TimestepEmbedding,
     make_cosine_schedule,         # re-exported for callers that want one source of truth
     SampleQualityCallback,        # re-exported (the training notebook reuses it)

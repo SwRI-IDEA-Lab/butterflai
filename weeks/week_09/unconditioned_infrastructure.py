@@ -1,5 +1,5 @@
 """
-unconditioned_models.py — ButterflAI Week 09 unconditional diffusion machinery.
+unconditioned_infrastructure.py — ButterflAI Week 09 unconditional diffusion machinery.
 
 Everything with a *definition* lives here: schedules, dataset, network modules,
 LightningModule, sampler, callbacks. The two Week 09 notebooks
