@@ -70,16 +70,16 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
     Conditioning standardization is different and important: the conditioning
     vector must be normalized using *train-split-only* statistics. The
     network learns to expect inputs in the train-set's normalized scale; if
-    val and test datasets standardized using their own statistics, the model
-    would see distributionally different conditioning at evaluation time
-    than it saw at training time, which silently corrupts the
+    the validation dataset were standardized using its own statistics, the
+    model would see distributionally different conditioning at evaluation
+    time than it saw at training time, which silently corrupts the
     cond-sensitivity check.
 
     Two construction patterns:
       - When `cond_means` / `cond_stds` are not supplied, the Dataset
         computes them from the train split of the supplied DataFrame
         (regardless of which split this Dataset itself represents). This
-        means you can construct val / test datasets directly without
+        means you can construct the val dataset directly without
         needing to construct the train dataset first.
       - When `cond_means` / `cond_stds` *are* supplied, they are used as-is.
         Useful for downstream code that already has the statistics in hand
