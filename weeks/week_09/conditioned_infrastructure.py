@@ -114,7 +114,7 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
             df_train = df[df["split"] == "train"]
             cond_train = df_train[self.COND_COLS].to_numpy().astype(np.float32)  # shape (N_train, 2)
             self.cond_means = torch.tensor(cond_train.mean(axis=0), dtype=torch.float32)  # shape (2,)
-            self.cond_stds = torch.tensor(cond_train.std(axis=0), dtype=torch.float32)  # shape (2,)
+            self.cond_stds = torch.tensor(cond_train.std(axis=0, ddof=1), dtype=torch.float32).clamp(min=1e-6)        
         else:
             self.cond_means = torch.as_tensor(cond_means, dtype=torch.float32)  # shape (2,)
             self.cond_stds = torch.as_tensor(cond_stds, dtype=torch.float32)
