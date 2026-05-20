@@ -91,35 +91,52 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
     COND_COLS = ["area_smoothed", "mu_universal"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
-        # Tasks:
-        #   1. Filter `df` to rows with `split` column equal to `split`,
-        #      reset_index(drop=True).
-        #   2. Extract the 15 emp and 15 par columns as float32 numpy arrays;
-        #      compute residuals = emp - par as a torch.float32 tensor of
-        #      shape (N, 15).
-        #   3. Compute per-bin self.bin_means and self.bin_stds (clamp the
-        #      stds at 1e-6 so division is safe); store
-        #      self._residuals = (residuals - bin_means) / bin_stds.
-        #   4. Determine the conditioning standardization statistics:
-        #        - If cond_means is None or cond_stds is None: compute them
-        #          from the TRAIN rows of the supplied `df` (so non-train
-        #          datasets still get train-split-only normalization).
-        #        - Otherwise: use the supplied values, converted to
-        #          torch.float32 tensors.
-        #      Store as self.cond_means, self.cond_stds.
-        #   5. Extract the COND_COLS from df_split, standardize using
-        #      cond_means / cond_stds, store as self._cond
-        #      (shape (N, 2), float32).
-        raise NotImplementedError("Implement ConditionalResidualDataset.__init__")
+        # Filter `df` to rows with `split` column equal to `split`, reset_index(drop=True)
+        df_split = df[df["split"] == split].reset_index(drop=True)
+        
+        # Extract the 15 emp and 15 par columns as float32 numpy arrays; 
+        # compute residuals = emp - par as a torch.float32 tensor of shape (N, 15).
+        emp = df_split[self.HIST_COLS].values.astype(np.float32)
+        par = df_split[self.PAR_COLS].values.astype(np.float32)
+        residuals = torch.from_numpy(emp - par)  # shape (N, 15)
+        
+        # Compute per-bin self.bin_means and self.bin_stds (clamp the
+        # stds at 1e-6 so division is safe); store self._residuals = (residuals - bin_means) / bin_stds.
+        self.bin_means = residuals.mean(dim=0)  # shape (15,)
+        self.bin_stds = residuals.std(dim=0).clamp(min=1e-6)  # shape (15,)
+        self._residuals = (residuals - self.bin_means) / self.bin_stds  # shape (N, 15)
+        
+        # Determine the conditioning standardization statistics: 
+        # If cond_means is None or cond_stds is None: compute them from the TRAIN rows of the supplied 
+        # `df` (so non-train datasets still get train-split-only normalization).
+        # Otherwise: use the supplied values, converted to torch.float32 tensors. Store as self.cond_means, self.cond_stds.
+        if cond_means is None or cond_stds is None:
+            df_train = df[df["split"] == "train"]
+            cond_train = df_train[self.COND_COLS].to_numpy().astype(np.float32)  # shape (N_train, 2)
+            self.cond_means = torch.tensor(cond_train.mean(axis=0), dtype=torch.float32)  # shape (2,)
+            self.cond_stds = torch.tensor(cond_train.std(axis=0), dtype=torch.float32)  # shape (2,)
+        else:
+            self.cond_means = torch.as_tensor(cond_means, dtype=torch.float32)  # shape (2,)
+            self.cond_stds = torch.as_tensor(cond_stds, dtype=torch.float32)
+
+        # Extract the COND_COLS from df_split, standardize using cond_means / cond_stds, store as self._cond
+        # (shape (N, 2), float32).
+        cond_vals = df_split[self.COND_COLS].to_numpy().astype(np.float32)  # shape (N, 2)
+        cond_tensor = torch.from_numpy(cond_vals)  # shape (N, 2)
+        self._cond = (cond_tensor - self.cond_means) / self.cond_stds  # shape (N, 2)
 
     def __len__(self):
-        raise NotImplementedError("Implement __len__")
+        return self._residuals.shape[0]
 
     def __getitem__(self, idx):
         # Returns a dict:
         #   {"r_clean": torch.float32 tensor of shape (15,),
         #    "cond":    torch.float32 tensor of shape (2,)}
-        raise NotImplementedError("Implement __getitem__")
+        
+        return {
+            "r_clean": self._residuals[idx],  # shape (15,)
+            "cond": self._cond[idx],          # shape (2,)
+        }
 
 
 # ─── Task 48 — ConditionalDiffusionMLP ─────────────────────────────────────
