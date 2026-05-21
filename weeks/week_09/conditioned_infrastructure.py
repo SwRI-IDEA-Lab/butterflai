@@ -350,18 +350,29 @@ def sample_conditional(
     -------
     torch.Tensor of shape (B, data_dim), in *physical* residual units
     (de-standardized using the module's bin_means / bin_stds buffers).
-    """
-    # Tasks:
-    #   1. If device is None, infer from next(lightning_module.parameters()).device.
-    #   2. lightning_module.eval(), .to(device); cond = cond.to(device).
-    #   3. B = cond.shape[0].
-    #   4. Initialize r_t = torch.randn(B, data_dim, device=device).
-    #   5. Loop t from T-1 down to 0:
-    #        - t_batch = torch.full((B,), t, dtype=torch.long, device=device).
-    #        - eps_hat = lightning_module.model(r_t, t_batch, cond).
-    #        - alpha_t, sigma_t = lightning_module.alpha[t], lightning_module.sigma[t].
-    #        - r_0_hat = (r_t - sigma_t * eps_hat) / alpha_t.
-    #        - if t > 0: r_t = alpha[t-1] * r_0_hat + sigma[t-1] * eps_hat.
-    #          else:     r_t = r_0_hat.
-    #   6. De-standardize: r_t * bin_stds + bin_means, return.
-    raise NotImplementedError("Implement sample_conditional")
+    """    
+    if device is None:
+        device = next(lightning_module.parameters()).device
+        
+    lightning_module.eval()
+    lightning_module.to(device)
+    cond = cond.to(device)
+    
+    B = cond.shape[0]
+    r_t = torch.randn(B, data_dim, device=device)
+    
+    for t in range(lightning_module.T - 1, -1, -1):
+        t_batch = torch.full((B,), t, dtype=torch.long, device=device)
+        eps_hat = lightning_module.model(r_t, t_batch, cond)
+        
+        alpha_t = lightning_module.alpha[t]
+        sigma_t = lightning_module.sigma[t]
+        
+        r_0_hat = (r_t - sigma_t * eps_hat) / alpha_t
+        
+        if t > 0:
+            r_t = lightning_module.alpha[t-1] * r_0_hat + lightning_module.sigma[t-1] * eps_hat
+        else:
+            r_t = r_0_hat        
+            
+    return r_t * lightning_module.bin_stds + lightning_module.bin_means
