@@ -164,27 +164,27 @@ class ConditionalDiffusionMLP(nn.Module):
         n_layers: int = 3,
     ):
         super().__init__()
-        # Tasks:
-        #   1. self.data_dim = data_dim, self.cond_dim = cond_dim.
-        #   2. self.t_embedding = TimestepEmbedding(t_embed_dim, t_hidden_dim).
-        #   3. Compute the main MLP's input dimension:
-        #         in_dim = data_dim + t_hidden_dim + cond_dim
-        #   4. Build the main MLP as `n_layers` hidden layers of
-        #      `hidden_dim` units with SiLU activations between them, then
-        #      a final Linear(hidden_dim, data_dim) with no activation on
-        #      the output (ε can take any real value). Store as self.net.
-        raise NotImplementedError("Implement ConditionalDiffusionMLP.__init__")
+        self.data_dim = data_dim
+        self.cond_dim = cond_dim
+
+        self.t_embedding = TimestepEmbedding(t_embed_dim, t_hidden_dim)
+        
+        in_dim = data_dim + t_hidden_dim + cond_dim
+        
+        layers = []
+        prev = in_dim
+        for _ in range(n_layers):
+            layers.append(nn.Linear(prev, hidden_dim))
+            layers.append(nn.SiLU())
+            prev = hidden_dim
+        layers.append(nn.Linear(prev, data_dim))  # final layer to output eps_hat
+        self.net = nn.Sequential(*layers)
 
     def forward(self, r_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # r_t  shape: (B, data_dim)
-        # t    shape: (B,)
-        # cond shape: (B, cond_dim)
-        # Returns eps_hat shape: (B, data_dim)
-        # Tasks:
-        #   1. t_emb = self.t_embedding(t)             # (B, t_hidden_dim)
-        #   2. x = torch.cat([r_t, t_emb, cond], dim=-1)
-        #   3. return self.net(x)
-        raise NotImplementedError("Implement ConditionalDiffusionMLP.forward")
+        t_emb = self.t_embedding(t)  # shape (B, t_hidden_dim)
+        x = torch.cat([r_t, t_emb, cond], dim=-1)  # shape (B, data_dim + t_hidden_dim + cond_dim)
+        eps_hat = self.net(x)  # shape (B, data_dim)
+        return eps_hat
 
 
 # ─── Task 50 — ConditionalDiffusionLightning ───────────────────────────────
