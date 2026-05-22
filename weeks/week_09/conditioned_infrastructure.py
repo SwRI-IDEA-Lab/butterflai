@@ -91,35 +91,45 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
     COND_COLS = ["amplitude", "mu_universal"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
-        # Tasks:
-        #   1. Filter `df` to rows with `split` column equal to `split`,
-        #      reset_index(drop=True).
-        #   2. Extract the 15 emp and 15 par columns as float32 numpy arrays;
-        #      compute residuals = emp - par as a torch.float32 tensor of
-        #      shape (N, 15).
-        #   3. Compute per-bin self.bin_means and self.bin_stds (clamp the
-        #      stds at 1e-6 so division is safe); store
-        #      self._residuals = (residuals - bin_means) / bin_stds.
-        #   4. Determine the conditioning standardization statistics:
-        #        - If cond_means is None or cond_stds is None: compute them
-        #          from the TRAIN rows of the supplied `df` (so non-train
-        #          datasets still get train-split-only normalization).
-        #        - Otherwise: use the supplied values, converted to
-        #          torch.float32 tensors.
-        #      Store as self.cond_means, self.cond_stds.
-        #   5. Extract the COND_COLS from df_split, standardize using
-        #      cond_means / cond_stds, store as self._cond
-        #      (shape (N, 2), float32).
-        raise NotImplementedError("Implement ConditionalResidualDataset.__init__")
+        df_split = df.loc[df["split"] == split].reset_index(drop=True)
+
+        emp = df_split[self.HIST_COLS].to_numpy(dtype=np.float32)
+        par = df_split[self.PAR_COLS].to_numpy(dtype=np.float32)
+        residuals = torch.from_numpy(emp - par)                       # (N, 15)
+
+        self.bin_means = residuals.mean(dim=0)                        # (15,)
+        self.bin_stds = residuals.std(dim=0).clamp(min=1e-6)          # (15,)
+        self._residuals = (residuals - self.bin_means) / self.bin_stds
+
+        if cond_means is None or cond_stds is None:
+            train_df = df.loc[df["split"] == "train"]
+            train_cond = train_df[self.COND_COLS].to_numpy(dtype=np.float32)
+            cond_means = torch.from_numpy(train_cond.mean(axis=0)).to(torch.float32)
+            # Use ddof=1 to match torch.std(unbiased=True) used when verifying
+            # the normalized training std; this keeps numpy/torch calculations
+            # consistent and avoids small off-by-ddof differences.
+            cond_stds = torch.from_numpy(train_cond.std(axis=0, ddof=1).clip(min=1e-6)).to(torch.float32)
+        else:
+            cond_means = torch.as_tensor(cond_means, dtype=torch.float32)
+            cond_stds = torch.as_tensor(cond_stds, dtype=torch.float32)
+
+        self.cond_means = cond_means
+        self.cond_stds = cond_stds
+
+        cond = df_split[self.COND_COLS].to_numpy(dtype=np.float32)
+        self._cond = (torch.from_numpy(cond) - self.cond_means) / self.cond_stds
 
     def __len__(self):
-        raise NotImplementedError("Implement __len__")
+        return self._residuals.shape[0]
 
     def __getitem__(self, idx):
         # Returns a dict:
         #   {"r_clean": torch.float32 tensor of shape (15,),
         #    "cond":    torch.float32 tensor of shape (2,)}
-        raise NotImplementedError("Implement __getitem__")
+        return {
+            "r_clean": self._residuals[idx],
+            "cond": self._cond[idx],
+        }
 
 
 # ─── Task 48 — ConditionalDiffusionMLP ─────────────────────────────────────
