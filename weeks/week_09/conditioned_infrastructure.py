@@ -70,16 +70,16 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
     Conditioning standardization is different and important: the conditioning
     vector must be normalized using *train-split-only* statistics. The
     network learns to expect inputs in the train-set's normalized scale; if
-    the validation dataset were standardized using its own statistics, the
-    model would see distributionally different conditioning at evaluation
-    time than it saw at training time, which silently corrupts the
+    val and test datasets standardized using their own statistics, the model
+    would see distributionally different conditioning at evaluation time
+    than it saw at training time, which silently corrupts the
     cond-sensitivity check.
 
     Two construction patterns:
       - When `cond_means` / `cond_stds` are not supplied, the Dataset
         computes them from the train split of the supplied DataFrame
         (regardless of which split this Dataset itself represents). This
-        means you can construct the val dataset directly without
+        means you can construct val / test datasets directly without
         needing to construct the train dataset first.
       - When `cond_means` / `cond_stds` *are* supplied, they are used as-is.
         Useful for downstream code that already has the statistics in hand
@@ -91,35 +91,45 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
     COND_COLS = ["area_smoothed", "mu_universal"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
-        # Tasks:
-        #   1. Filter `df` to rows with `split` column equal to `split`,
-        #      reset_index(drop=True).
-        #   2. Extract the 15 emp and 15 par columns as float32 numpy arrays;
-        #      compute residuals = emp - par as a torch.float32 tensor of
-        #      shape (N, 15).
-        #   3. Compute per-bin self.bin_means and self.bin_stds (clamp the
-        #      stds at 1e-6 so division is safe); store
-        #      self._residuals = (residuals - bin_means) / bin_stds.
-        #   4. Determine the conditioning standardization statistics:
-        #        - If cond_means is None or cond_stds is None: compute them
-        #          from the TRAIN rows of the supplied `df` (so non-train
-        #          datasets still get train-split-only normalization).
-        #        - Otherwise: use the supplied values, converted to
-        #          torch.float32 tensors.
-        #      Store as self.cond_means, self.cond_stds.
-        #   5. Extract the COND_COLS from df_split, standardize using
-        #      cond_means / cond_stds, store as self._cond
-        #      (shape (N, 2), float32).
-        raise NotImplementedError("Implement ConditionalResidualDataset.__init__")
+        df_split = df.loc[df["split"] == split].reset_index(drop=True)
+
+        emp = df_split[self.HIST_COLS].to_numpy(dtype=np.float32)
+        par = df_split[self.PAR_COLS].to_numpy(dtype=np.float32)
+        residuals = torch.from_numpy(emp - par)                       # (N, 15)
+
+        self.bin_means = residuals.mean(dim=0)                        # (15,)
+        self.bin_stds = residuals.std(dim=0).clamp(min=1e-6)          # (15,)
+        self._residuals = (residuals - self.bin_means) / self.bin_stds
+
+        if cond_means is None or cond_stds is None:
+            train_df = df.loc[df["split"] == "train"]
+            train_cond = train_df[self.COND_COLS].to_numpy(dtype=np.float32)
+            cond_means = torch.from_numpy(train_cond.mean(axis=0)).to(torch.float32)
+            # Use ddof=1 to match torch.std(unbiased=True) used when verifying
+            # the normalized training std; this keeps numpy/torch calculations
+            # consistent and avoids small off-by-ddof differences.
+            cond_stds = torch.from_numpy(train_cond.std(axis=0, ddof=1).clip(min=1e-6)).to(torch.float32)
+        else:
+            cond_means = torch.as_tensor(cond_means, dtype=torch.float32)
+            cond_stds = torch.as_tensor(cond_stds, dtype=torch.float32)
+
+        self.cond_means = cond_means
+        self.cond_stds = cond_stds
+
+        cond = df_split[self.COND_COLS].to_numpy(dtype=np.float32)
+        self._cond = (torch.from_numpy(cond) - self.cond_means) / self.cond_stds
 
     def __len__(self):
-        raise NotImplementedError("Implement __len__")
+        return self._residuals.shape[0]
 
     def __getitem__(self, idx):
         # Returns a dict:
         #   {"r_clean": torch.float32 tensor of shape (15,),
         #    "cond":    torch.float32 tensor of shape (2,)}
-        raise NotImplementedError("Implement __getitem__")
+        return {
+            "r_clean": self._residuals[idx],
+            "cond": self._cond[idx],
+        }
 
 
 # ─── Task 48 — ConditionalDiffusionMLP ─────────────────────────────────────
@@ -147,27 +157,27 @@ class ConditionalDiffusionMLP(nn.Module):
         n_layers: int = 3,
     ):
         super().__init__()
-        # Tasks:
-        #   1. self.data_dim = data_dim, self.cond_dim = cond_dim.
-        #   2. self.t_embedding = TimestepEmbedding(t_embed_dim, t_hidden_dim).
-        #   3. Compute the main MLP's input dimension:
-        #         in_dim = data_dim + t_hidden_dim + cond_dim
-        #   4. Build the main MLP as `n_layers` hidden layers of
-        #      `hidden_dim` units with SiLU activations between them, then
-        #      a final Linear(hidden_dim, data_dim) with no activation on
-        #      the output (ε can take any real value). Store as self.net.
-        raise NotImplementedError("Implement ConditionalDiffusionMLP.__init__")
+        self.data_dim = data_dim
+        self.cond_dim = cond_dim
+        self.t_embedding = TimestepEmbedding(t_embed_dim, t_hidden_dim)
+
+        in_dim = data_dim + t_hidden_dim + cond_dim
+        layers = []
+        for _ in range(n_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, data_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, r_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # r_t  shape: (B, data_dim)
         # t    shape: (B,)
         # cond shape: (B, cond_dim)
         # Returns eps_hat shape: (B, data_dim)
-        # Tasks:
-        #   1. t_emb = self.t_embedding(t)             # (B, t_hidden_dim)
-        #   2. x = torch.cat([r_t, t_emb, cond], dim=-1)
-        #   3. return self.net(x)
-        raise NotImplementedError("Implement ConditionalDiffusionMLP.forward")
+        t_emb = self.t_embedding(t)
+        x = torch.cat([r_t, t_emb, cond], dim=-1)
+        return self.net(x)
 
 
 # ─── Task 50 — ConditionalDiffusionLightning ───────────────────────────────
@@ -210,40 +220,52 @@ class ConditionalDiffusionLightning(pl.LightningModule):
         cond_stds=None,
     ):
         super().__init__()
-        # Tasks:
-        #   1. self.save_hyperparameters(ignore=[
-        #          "model", "alpha", "sigma",
-        #          "bin_means", "bin_stds",
-        #          "cond_means", "cond_stds",
-        #      ])
-        #   2. Store self.model, self.T, self.lr, self.scheduler_kind,
-        #      self.weight_decay (cast lr/weight_decay to float, T to int,
-        #      scheduler to str — same pattern as Week 08).
-        #   3. Register `alpha`, `sigma`, `bin_means`, `bin_stds`,
-        #      `cond_means`, `cond_stds` as float32 buffers. The four
-        #      statistics buffers may be None at construction time (e.g.
-        #      placeholders for load_from_checkpoint) — handle that by
-        #      either registering zero/one placeholders or by setting the
-        #      attribute to None. The cleanest pattern: register all four
-        #      as buffers (use zeros / ones if None was passed) so they
-        #      always exist as state_dict entries that get overwritten at
-        #      load time.
-        raise NotImplementedError("Implement ConditionalDiffusionLightning.__init__")
+        self.save_hyperparameters(ignore=[
+            "model", "alpha", "sigma",
+            "bin_means", "bin_stds",
+            "cond_means", "cond_stds",
+        ])
+
+        self.model          = model
+        self.T              = int(T)
+        self.lr             = float(lr)
+        self.scheduler_kind = str(scheduler)
+        self.weight_decay   = float(weight_decay)
+
+        self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
+        self.register_buffer("sigma", torch.as_tensor(sigma, dtype=torch.float32))
+
+        data_dim = getattr(model, "data_dim", 15)
+        cond_dim = getattr(model, "cond_dim", 2)
+
+        if bin_means is not None and bin_stds is not None:
+            self.register_buffer("bin_means", torch.as_tensor(bin_means, dtype=torch.float32))
+            self.register_buffer("bin_stds", torch.as_tensor(bin_stds, dtype=torch.float32))
+        else:
+            self.register_buffer("bin_means", torch.zeros(data_dim, dtype=torch.float32))
+            self.register_buffer("bin_stds", torch.ones(data_dim, dtype=torch.float32))
+
+        if cond_means is not None and cond_stds is not None:
+            self.register_buffer("cond_means", torch.as_tensor(cond_means, dtype=torch.float32))
+            self.register_buffer("cond_stds", torch.as_tensor(cond_stds, dtype=torch.float32))
+        else:
+            self.register_buffer("cond_means", torch.zeros(cond_dim, dtype=torch.float32))
+            self.register_buffer("cond_stds", torch.ones(cond_dim, dtype=torch.float32))
 
     def _shared_step(self, batch):
-        # `batch` is a dict from the DataLoader (after default collation):
-        #   batch["r_clean"] : (B, 15) float32, the standardized residuals.
-        #   batch["cond"]    : (B, 2)  float32, the normalized conditioning.
-        # Tasks:
-        #   1. Read by key: r_clean = batch["r_clean"], cond = batch["cond"].
-        #   2. Sample t = torch.randint(0, self.T, (B,), device=r_clean.device).
-        #   3. Draw eps = torch.randn_like(r_clean).
-        #   4. Look up alpha_t and sigma_t from self.alpha[t], self.sigma[t],
-        #      reshape to (B, 1) via einops.rearrange.
-        #   5. Compute r_t = alpha_t * r_clean + sigma_t * eps.
-        #   6. Compute eps_hat = self.model(r_t, t, cond).
-        #   7. Return F.mse_loss(eps_hat, eps).
-        raise NotImplementedError("Implement _shared_step")
+        r_clean = batch["r_clean"]
+        cond = batch["cond"]
+
+        B = r_clean.shape[0]
+        t = torch.randint(0, self.T, (B,), device=r_clean.device)
+        eps = torch.randn_like(r_clean)
+
+        alpha_t = rearrange(self.alpha[t], "b -> b 1")
+        sigma_t = rearrange(self.sigma[t], "b -> b 1")
+        r_t = alpha_t * r_clean + sigma_t * eps
+
+        eps_hat = self.model(r_t, t, cond)
+        return F.mse_loss(eps_hat, eps)
 
     def training_step(self, batch, batch_idx):
         loss = self._shared_step(batch)
@@ -256,13 +278,44 @@ class ConditionalDiffusionLightning(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        # This method is *identical* to the Week 08 DiffusionLightning's
-        # configure_optimizers: AdamW with biases and 1-D params in a
-        # no-weight-decay group, plus a "cosine" or "plateau" LR scheduler
-        # chosen via self.scheduler_kind. Copy your Week 08 implementation
-        # here — same signature, same logic. Nothing about conditioning
-        # changes how the optimizer is built.
-        raise NotImplementedError("Copy from Week 08 DiffusionLightning.configure_optimizers")
+        decay_params, no_decay_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 1 or name.endswith(".bias"):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay_params,    "weight_decay": self.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=self.lr,
+        )
+
+        if self.scheduler_kind == "plateau":
+            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=20, min_lr=1e-4
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": sched, "monitor": "val_loss", "interval": "epoch"},
+            }
+        if self.scheduler_kind == "cosine":
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.trainer.estimated_stepping_batches,
+                eta_min=1e-4,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": sched, "interval": "step"},
+            }
+        if self.scheduler_kind == "none":
+            return optimizer
+        raise ValueError(f"unknown scheduler {self.scheduler_kind!r}")
 
 
 # ─── Task 52 — sample_conditional ──────────────────────────────────────────
@@ -308,4 +361,30 @@ def sample_conditional(
     #        - if t > 0: r_t = alpha[t-1] * r_0_hat + sigma[t-1] * eps_hat.
     #          else:     r_t = r_0_hat.
     #   6. De-standardize: r_t * bin_stds + bin_means, return.
-    raise NotImplementedError("Implement sample_conditional")
+    if device is None:
+        device = next(lightning_module.parameters()).device
+    lightning_module = lightning_module.to(device).eval()
+    cond = cond.to(device)
+
+    B = cond.shape[0]
+    r_t = torch.randn(B, data_dim, device=device)
+
+    alpha = lightning_module.alpha
+    sigma = lightning_module.sigma
+
+    for t in range(lightning_module.T - 1, -1, -1):
+        t_batch = torch.full((B,), t, dtype=torch.long, device=device)
+        eps_hat = lightning_module.model(r_t, t_batch, cond)
+
+        alpha_t = alpha[t]
+        sigma_t = sigma[t]
+        r_0_hat = (r_t - sigma_t * eps_hat) / alpha_t
+
+        if t > 0:
+            r_t = alpha[t - 1] * r_0_hat + sigma[t - 1] * eps_hat
+        else:
+            r_t = r_0_hat
+
+    if lightning_module.bin_means is not None and lightning_module.bin_stds is not None:
+        return r_t * lightning_module.bin_stds.to(device) + lightning_module.bin_means.to(device)
+    return r_t
