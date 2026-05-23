@@ -1290,3 +1290,27 @@ def k_run_combined(
         nlls.append(nll)
         floors.append(det["floor_fraction"])
     return np.asarray(nlls), np.asarray(floors)
+
+
+def discover_experiment_checkpoints(
+    ckpt_dir: str,
+    prefix: str = "ckpt_",
+    suffix: str = ".ckpt",
+) -> Dict[str, str]:
+    """Discover trained experiment checkpoints in a directory.
+
+    Scans ``ckpt_dir`` for files matching ``{prefix}<name>{suffix}`` and
+    returns a mapping ``{<name>: <absolute path>}`` sorted by ``<name>``.
+    Used by the eval phase of the merged notebook to pick up whichever
+    experiments train mode has produced so far. Callers typically assert
+    that each discovered ``<name>`` appears as a key in their
+    ``EXPERIMENTS`` dict.
+    """
+    import glob as _glob
+    paths = sorted(_glob.glob(os.path.join(ckpt_dir, f"{prefix}*{suffix}")))
+    out: Dict[str, str] = {}
+    for p in paths:
+        base = os.path.basename(p)
+        name = base[len(prefix):-len(suffix)] if suffix else base[len(prefix):]
+        out[name] = p
+    return out
