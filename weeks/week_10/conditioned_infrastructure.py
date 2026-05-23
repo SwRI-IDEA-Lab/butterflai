@@ -47,13 +47,14 @@ from unconditioned_infrastructure import (
 
 class ConditionalResidualDataset(torch.utils.data.Dataset):
     """Indexed clean residuals (hist_emp − hist_par) plus normalized
-    conditioning covariates (area_smoothed, mu_universal) for one split.
+    conditioning covariates (area_smoothed, mu_universal, model_sigma,
+    amplitude) for one split.
 
     `__getitem__(idx)` returns a **dictionary**:
 
         {
             "r_clean": torch.float32 tensor, shape (15,),
-            "cond":    torch.float32 tensor, shape (2,),
+            "cond":    torch.float32 tensor, shape (4,),
         }
 
     Per-bin residual standardization is identical to the Week 08 dataset:
@@ -68,7 +69,7 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
 
     HIST_COLS = [f"hist_emp_{j:02d}" for j in range(15)]
     PAR_COLS  = [f"hist_par_{j:02d}" for j in range(15)]
-    COND_COLS = ["area_smoothed", "mu_universal"]
+    COND_COLS = ["area_smoothed", "mu_universal", "model_sigma", "amplitude"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
         df_split = df.loc[df["split"] == split].reset_index(drop=True)
@@ -96,8 +97,8 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
 
         cond_raw  = torch.from_numpy(
             df_split[self.COND_COLS].to_numpy(dtype=np.float32)
-        )                                                                # (N, 2)
-        self._cond = (cond_raw - self.cond_means) / self.cond_stds       # (N, 2)
+        )                                                                # (N, 4)
+        self._cond = (cond_raw - self.cond_means) / self.cond_stds       # (N, 4)
 
     def __len__(self):
         return self._residuals.shape[0]
@@ -123,7 +124,7 @@ class ConditionalDiffusionMLP(nn.Module):
     def __init__(
         self,
         data_dim: int = 15,
-        cond_dim: int = 2,
+        cond_dim: int = 4,
         hidden_dim: int = 128,
         t_embed_dim: int = 64,
         t_hidden_dim: int = 128,
@@ -157,7 +158,7 @@ class ConditionalDiffusionLightning(pl.LightningModule):
     """Conditional version of DiffusionLightning.
 
     Each training/validation batch arrives as a **dict**
-    ``{"r_clean": (B, 15), "cond": (B, 2)}``. The model call gets an extra
+    ``{"r_clean": (B, 15), "cond": (B, 4)}``. The model call gets an extra
     ``cond`` argument; everything else (schedule buffers, AdamW with
     no-decay split, cosine/plateau LR schedulers, save_hyperparameters)
     is unchanged from Week 08.
@@ -206,9 +207,9 @@ class ConditionalDiffusionLightning(pl.LightningModule):
                        else torch.as_tensor(bin_means, dtype=torch.float32))
         bin_stds_t  = (torch.ones(15, dtype=torch.float32)  if bin_stds  is None
                        else torch.as_tensor(bin_stds,  dtype=torch.float32))
-        cond_means_t = (torch.zeros(2, dtype=torch.float32) if cond_means is None
+        cond_means_t = (torch.zeros(4, dtype=torch.float32) if cond_means is None
                         else torch.as_tensor(cond_means, dtype=torch.float32))
-        cond_stds_t  = (torch.ones(2, dtype=torch.float32)  if cond_stds  is None
+        cond_stds_t  = (torch.ones(4, dtype=torch.float32)  if cond_stds  is None
                         else torch.as_tensor(cond_stds,  dtype=torch.float32))
         self.register_buffer("bin_means",  bin_means_t)
         self.register_buffer("bin_stds",   bin_stds_t)
@@ -218,7 +219,7 @@ class ConditionalDiffusionLightning(pl.LightningModule):
     # ── training / validation share the same forward corruption ───────────
     def _shared_step(self, batch):
         r_clean = batch["r_clean"]                                       # (B, 15)
-        cond    = batch["cond"]                                          # (B, 2)
+        cond    = batch["cond"]                                          # (B, 4)
         B       = r_clean.shape[0]
         t       = torch.randint(0, self.T, (B,), device=r_clean.device)
         eps     = torch.randn_like(r_clean)
@@ -338,3 +339,954 @@ def sample_conditional(
             r_t = r_0_hat
 
     return r_t * lightning_module.bin_stds.to(device) + lightning_module.bin_means.to(device)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Week-10 extension — dict-of-groups conditioning, FiLM, CFG, factory.
+#
+# Everything above this banner is the as-shipped Week 10 reference and is
+# load-bearing for notebooks 10a/10b/10c — do not edit those classes. The
+# additions below are used by 10d/10e (the ablation study). They are
+# strictly additive: importing this module under the old names still
+# resolves the legacy classes byte-for-byte.
+# ══════════════════════════════════════════════════════════════════════════
+
+from typing import Optional, Sequence, Dict, Tuple, List
+
+
+# ─── Task 60-helper — dict-of-groups dataset ──────────────────────────────
+
+class ExtendedConditionalResidualDataset(torch.utils.data.Dataset):
+    """Conditional residual dataset where each conditioning *group* is its
+    own dict entry. Adding a new group never breaks anything that already
+    consumes the dataset — it just adds new keys to the returned dict.
+
+    `__getitem__(idx)` returns a dictionary with these keys (subset
+    determined by ``groups``):
+
+        {
+            "r_clean":          float32 tensor (15,),
+            "cond_base":        float32 tensor (4,),     "base" in groups
+            "cond_cyclehemi":   float32 tensor (2,),     "cyclehemi"
+            "cond_opp":         float32 tensor (3,),     "opp"
+            "cond_opp_valid":   float32 tensor (1,),     "opp"
+            "cond_traj":        float32 tensor (K,),     "traj"
+            "cond_traj_valid":  float32 tensor (1,),     "traj"
+        }
+
+    Each cond group is standardized using **train-split-only** statistics.
+    Validity flags ("..._valid") are NOT standardized; they are passed
+    through as float32 0/1 so a downstream model can use them as a mask.
+    """
+
+    GROUP_COLS: Dict[str, List[str]] = {
+        "base":       ["area_smoothed", "mu_universal", "model_sigma", "amplitude"],
+        "cyclehemi":  ["cycle_norm", "hemi_id"],
+        "opp":        ["opp_area_smoothed", "opp_mu_universal", "opp_amplitude"],
+        # "traj" is dynamic (K columns) — resolved at __init__ time.
+    }
+    GROUP_VALIDITY: Dict[str, str] = {
+        "opp":  "opp_valid",
+        "traj": "traj_valid",
+    }
+
+    HIST_COLS = [f"hist_emp_{j:02d}" for j in range(15)]
+    PAR_COLS  = [f"hist_par_{j:02d}" for j in range(15)]
+
+    def __init__(
+        self,
+        df,
+        split: str,
+        groups: Sequence[str] = ("base",),
+        group_stats: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ):
+        self.groups = list(groups)
+        unknown = set(self.groups) - (set(self.GROUP_COLS) | {"traj"})
+        if unknown:
+            raise ValueError(f"unknown conditioning group(s): {unknown}")
+
+        # Resolve "traj" columns (area_lag1, area_lag2, …) from the df schema.
+        self._group_cols: Dict[str, List[str]] = {}
+        for g in self.groups:
+            if g == "traj":
+                self._group_cols[g] = sorted(
+                    [c for c in df.columns if c.startswith("area_lag")],
+                    key=lambda c: int(c.replace("area_lag", "")),
+                )
+                if not self._group_cols[g]:
+                    raise ValueError("'traj' group requested but no area_lag* "
+                                     "columns found in df")
+            else:
+                self._group_cols[g] = list(self.GROUP_COLS[g])
+
+        df_split = df.loc[df["split"] == split].reset_index(drop=True)
+
+        # Residuals + per-bin standardization (same convention as Week 08).
+        emp = df_split[self.HIST_COLS].to_numpy(dtype=np.float32)
+        par = df_split[self.PAR_COLS].to_numpy(dtype=np.float32)
+        residuals = torch.from_numpy(emp - par)
+        self.bin_means = residuals.mean(dim=0)
+        self.bin_stds  = residuals.std(dim=0).clamp(min=1e-6)
+        self._residuals = (residuals - self.bin_means) / self.bin_stds
+
+        # Per-group standardization — train-split-only.
+        if group_stats is None:
+            df_train = df.loc[df["split"] == "train"]
+            self.group_stats: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+            for g in self.groups:
+                cols = self._group_cols[g]
+                raw  = torch.from_numpy(df_train[cols].to_numpy(dtype=np.float32))
+                means = raw.mean(dim=0)
+                stds  = raw.std(dim=0).clamp(min=1e-6)
+                self.group_stats[g] = (means, stds)
+        else:
+            self.group_stats = {
+                g: (torch.as_tensor(group_stats[g][0], dtype=torch.float32),
+                    torch.as_tensor(group_stats[g][1], dtype=torch.float32))
+                for g in self.groups
+            }
+
+        # Pre-compute the normalized cond tensors and validity masks per group.
+        self._cond: Dict[str, torch.Tensor] = {}
+        self._valid: Dict[str, torch.Tensor] = {}
+        for g in self.groups:
+            cols = self._group_cols[g]
+            raw  = torch.from_numpy(df_split[cols].to_numpy(dtype=np.float32))
+            means, stds = self.group_stats[g]
+            self._cond[g] = (raw - means) / stds
+            if g in self.GROUP_VALIDITY:
+                col = self.GROUP_VALIDITY[g]
+                if col not in df_split.columns:
+                    raise ValueError(f"group '{g}' requires validity column "
+                                     f"'{col}' in df")
+                v = torch.from_numpy(df_split[col].to_numpy(dtype=np.float32))
+                self._valid[g] = v.unsqueeze(-1)
+
+    @property
+    def group_dims(self) -> Dict[str, int]:
+        return {g: self._cond[g].shape[1] for g in self.groups}
+
+    def __len__(self) -> int:
+        return self._residuals.shape[0]
+
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
+        item: Dict[str, torch.Tensor] = {"r_clean": self._residuals[idx]}
+        for g in self.groups:
+            item[f"cond_{g}"] = self._cond[g][idx]
+            if g in self._valid:
+                item[f"cond_{g}_valid"] = self._valid[g][idx]
+        return item
+
+
+# ─── Task 65-helper — Fourier-feature embedding of cond scalars ───────────
+
+class FourierFeatureCondEmbedding(nn.Module):
+    """Project a continuous cond vector into a higher-dimensional space
+    via sin/cos at log-spaced frequencies, optionally concatenating the
+    raw values back in. Useful when the residual structure varies
+    nonlinearly with a continuous conditioning scalar.
+
+    Input  : (B, cond_dim) float32
+    Output : (B, cond_dim * (1 + 2 * n_freqs)) if include_raw else
+             (B, cond_dim * 2 * n_freqs)
+    """
+
+    def __init__(
+        self,
+        cond_dim: int,
+        n_freqs: int = 4,
+        max_freq: float = 8.0,
+        include_raw: bool = True,
+    ):
+        super().__init__()
+        self.cond_dim     = int(cond_dim)
+        self.n_freqs      = int(n_freqs)
+        self.include_raw  = bool(include_raw)
+        freqs = torch.logspace(0.0, np.log10(max_freq), n_freqs)
+        self.register_buffer("freqs", freqs)                             # (n_freqs,)
+
+    @property
+    def out_dim(self) -> int:
+        per = 2 * self.n_freqs + (1 if self.include_raw else 0)
+        return self.cond_dim * per
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        # cond: (B, cond_dim) → (B, cond_dim, n_freqs)
+        scaled = cond.unsqueeze(-1) * self.freqs                          # (B, D, F)
+        feats  = torch.cat([scaled.sin(), scaled.cos()], dim=-1)          # (B, D, 2F)
+        feats  = feats.reshape(cond.shape[0], -1)                         # (B, D*2F)
+        if self.include_raw:
+            feats = torch.cat([cond, feats], dim=-1)
+        return feats
+
+
+# ─── Task 66-helper — FiLM-conditioned ε-predictor MLP ────────────────────
+
+class FiLMConditionalDiffusionMLP(nn.Module):
+    """ε-predictor MLP that consumes (r_t, t, cond) like the Week 10
+    baseline but routes ``cond`` through a small embedding MLP that
+    produces *per-layer* (γ, β) modulation parameters. Each hidden layer
+    applies ``h ← γ * h + β`` before the SiLU.
+
+    The ``consumed_keys`` attribute tells the Lightning module which
+    batch-dict entries to concatenate into the ``cond`` argument; the
+    model itself only sees the concatenated vector.
+    """
+
+    def __init__(
+        self,
+        data_dim: int = 15,
+        cond_dim: int = 4,
+        hidden_dim: int = 128,
+        t_embed_dim: int = 64,
+        t_hidden_dim: int = 128,
+        cond_hidden_dim: int = 64,
+        n_layers: int = 3,
+        consumed_keys: Sequence[str] = ("cond_base",),
+        fourier: Optional[FourierFeatureCondEmbedding] = None,
+    ):
+        super().__init__()
+        self.data_dim       = int(data_dim)
+        self.cond_dim       = int(cond_dim)
+        self.hidden_dim     = int(hidden_dim)
+        self.n_layers       = int(n_layers)
+        self.consumed_keys  = list(consumed_keys)
+
+        self.t_embedding = TimestepEmbedding(t_embed_dim, t_hidden_dim)
+
+        # Optional Fourier-feature embedding on the cond vector.
+        self.fourier = fourier
+        cond_in_dim  = fourier.out_dim if fourier is not None else cond_dim
+
+        # Cond-embedding MLP: cond → (γ_1, β_1, γ_2, β_2, …, γ_L, β_L)
+        # Output flat dim = 2 * hidden_dim * n_layers.
+        film_out_dim = 2 * hidden_dim * n_layers
+        self.cond_embed = nn.Sequential(
+            nn.Linear(cond_in_dim, cond_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(cond_hidden_dim, film_out_dim),
+        )
+
+        # Input projection: r_t + t_emb → hidden_dim. cond is not concat
+        # at the input; it enters via FiLM modulation on each layer.
+        self.input_proj = nn.Linear(data_dim + t_hidden_dim, hidden_dim)
+
+        # Hidden layers (just linear maps — modulation handled in forward).
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)]
+        )
+        self.output_proj = nn.Linear(hidden_dim, data_dim)
+
+    def forward(self, r_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if self.fourier is not None:
+            cond = self.fourier(cond)
+        film_params = self.cond_embed(cond)                               # (B, 2*H*L)
+        film_params = film_params.reshape(-1, self.n_layers, 2, self.hidden_dim)
+        gammas = 1.0 + film_params[:, :, 0, :]                            # mean-1 init
+        betas  =       film_params[:, :, 1, :]
+
+        t_emb = self.t_embedding(t)                                       # (B, t_hidden_dim)
+        h = self.input_proj(torch.cat([r_t, t_emb], dim=-1))              # (B, H)
+        for layer_idx, lin in enumerate(self.layers):
+            h = lin(h)
+            h = gammas[:, layer_idx, :] * h + betas[:, layer_idx, :]
+            h = F.silu(h)
+        return self.output_proj(h)
+
+
+# ─── Concat variant carrying consumed_keys (factory parity) ───────────────
+
+class ExtendedConcatConditionalDiffusionMLP(ConditionalDiffusionMLP):
+    """Raw-concat MLP equivalent to the Week 10 baseline, but carrying a
+    ``consumed_keys`` attribute so the extended Lightning module knows
+    which batch-dict entries to concat into the ``cond`` argument. Adds
+    optional ``fourier`` lifting of the cond vector before the input
+    concat; pass ``fourier=None`` for the exact Week 10 behavior.
+    """
+
+    def __init__(
+        self,
+        data_dim: int = 15,
+        cond_dim: int = 4,
+        hidden_dim: int = 128,
+        t_embed_dim: int = 64,
+        t_hidden_dim: int = 128,
+        n_layers: int = 3,
+        consumed_keys: Sequence[str] = ("cond_base",),
+        fourier: Optional[FourierFeatureCondEmbedding] = None,
+    ):
+        # If Fourier lifting is requested, the parent class needs to know
+        # the *lifted* cond dim so its input layer is wide enough.
+        effective_cond_dim = fourier.out_dim if fourier is not None else cond_dim
+        super().__init__(
+            data_dim=data_dim, cond_dim=effective_cond_dim,
+            hidden_dim=hidden_dim, t_embed_dim=t_embed_dim,
+            t_hidden_dim=t_hidden_dim, n_layers=n_layers,
+        )
+        self.consumed_keys = list(consumed_keys)
+        self.fourier = fourier
+        # Track the *raw* cond dim separately so the Lightning module's
+        # null embedding is sized correctly (it standardizes pre-Fourier).
+        self.raw_cond_dim = int(cond_dim)
+
+    def forward(self, r_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if self.fourier is not None:
+            cond = self.fourier(cond)
+        return super().forward(r_t, t, cond)
+
+
+# ─── Task 66-helper — Extended Lightning module (dict batches + CFG) ──────
+
+class ExtendedConditionalDiffusionLightning(pl.LightningModule):
+    """Extended Week-10 LightningModule.
+
+    Differences from `ConditionalDiffusionLightning`:
+
+    1. Reads cond from a *dict* batch by concatenating
+       ``batch[k] for k in model.consumed_keys`` (validity masks are
+       routed through `consumed_keys` like any other group entry).
+    2. Persists per-group standardization statistics as named buffers
+       (``cond_<group>_means`` / ``cond_<group>_stds``) so the sampler
+       can recover them from a loaded checkpoint without the dataset.
+    3. Optional **classifier-free guidance** training via
+       ``cond_dropout_p``: with that probability per sample, the
+       concatenated cond is replaced by a learned null embedding
+       (``self.null_cond``, shape (total_cond_dim,)). At sampling time,
+       the same null vector is used for the unconditional branch.
+
+    The cosine schedule, AdamW no-decay split, and LR schedulers are
+    identical to the base class.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        alpha,
+        sigma,
+        T: int,
+        consumed_keys: Sequence[str],
+        group_stats: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        total_cond_dim: int,
+        lr: float = 1e-3,
+        scheduler: str = "cosine",
+        weight_decay: float = 1e-4,
+        cond_dropout_p: float = 0.0,
+        bin_means=None,
+        bin_stds=None,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=[
+            "model", "alpha", "sigma",
+            "bin_means", "bin_stds",
+            "group_stats",
+        ])
+
+        self.model          = model
+        self.T              = int(T)
+        self.lr             = float(lr)
+        self.scheduler_kind = str(scheduler)
+        self.weight_decay   = float(weight_decay)
+        self.cond_dropout_p = float(cond_dropout_p)
+        self.consumed_keys  = list(consumed_keys)
+        self.total_cond_dim = int(total_cond_dim)
+
+        self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
+        self.register_buffer("sigma", torch.as_tensor(sigma, dtype=torch.float32))
+
+        bin_means_t = (torch.zeros(15, dtype=torch.float32) if bin_means is None
+                       else torch.as_tensor(bin_means, dtype=torch.float32))
+        bin_stds_t  = (torch.ones(15, dtype=torch.float32)  if bin_stds  is None
+                       else torch.as_tensor(bin_stds,  dtype=torch.float32))
+        self.register_buffer("bin_means", bin_means_t)
+        self.register_buffer("bin_stds",  bin_stds_t)
+
+        # Per-group standardization buffers, named by group.
+        self._group_names: List[str] = []
+        for name, (means, stds) in group_stats.items():
+            self._group_names.append(name)
+            self.register_buffer(f"cond_{name}_means",
+                                 torch.as_tensor(means, dtype=torch.float32))
+            self.register_buffer(f"cond_{name}_stds",
+                                 torch.as_tensor(stds,  dtype=torch.float32))
+
+        # Learned null embedding for CFG. Always registered (zero-init);
+        # only updated/used when ``cond_dropout_p`` > 0 during training
+        # or when the sampler is called with ``guidance_w`` > 0.
+        self.null_cond = nn.Parameter(torch.zeros(self.total_cond_dim))
+
+    # ── helpers ───────────────────────────────────────────────────────────
+    def _concat_cond(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.cat([batch[k] for k in self.consumed_keys], dim=-1)
+
+    def _shared_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        r_clean = batch["r_clean"]
+        cond    = self._concat_cond(batch)
+        B       = r_clean.shape[0]
+
+        # CFG: drop the cond with probability p, replacing with null.
+        if self.cond_dropout_p > 0.0:
+            drop = (torch.rand(B, device=cond.device) < self.cond_dropout_p)
+            null = self.null_cond.to(cond.dtype).expand_as(cond)
+            cond = torch.where(drop.unsqueeze(-1), null, cond)
+
+        t       = torch.randint(0, self.T, (B,), device=r_clean.device)
+        eps     = torch.randn_like(r_clean)
+        alpha_t = rearrange(self.alpha[t], "b -> b 1")
+        sigma_t = rearrange(self.sigma[t], "b -> b 1")
+        r_t     = alpha_t * r_clean + sigma_t * eps
+
+        eps_hat = self.model(r_t, t, cond)
+        return F.mse_loss(eps_hat, eps)
+
+    def training_step(self, batch, batch_idx):
+        loss = self._shared_step(batch)
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss = self._shared_step(batch)
+        self.log("val_loss", loss, on_step=False, on_epoch=True)
+        return loss
+
+    def configure_optimizers(self):
+        decay_params, no_decay_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 1 or name.endswith(".bias"):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay_params,    "weight_decay": self.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=self.lr,
+        )
+
+        if self.scheduler_kind == "plateau":
+            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=20, min_lr=1e-4
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": sched, "monitor": "val_loss", "interval": "epoch"},
+            }
+        if self.scheduler_kind == "cosine":
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.trainer.estimated_stepping_batches,
+                eta_min=1e-4,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": sched, "interval": "step"},
+            }
+        if self.scheduler_kind == "none":
+            return optimizer
+        raise ValueError(f"unknown scheduler {self.scheduler_kind!r}")
+
+
+# ─── Task 68-helper — CFG-capable sampler (dict batches) ──────────────────
+
+@torch.no_grad()
+def sample_conditional_extended(
+    lightning_module: ExtendedConditionalDiffusionLightning,
+    cond: torch.Tensor,
+    guidance_w: float = 0.0,
+    data_dim: int = 15,
+    device=None,
+) -> torch.Tensor:
+    """DDIM sampling with optional classifier-free guidance.
+
+    ``cond`` is the already-concatenated, already-normalized conditioning
+    tensor of shape (B, total_cond_dim). The caller is responsible for
+    matching concat order to ``lightning_module.consumed_keys``.
+
+    ``guidance_w == 0`` reproduces the legacy `sample_conditional`
+    behavior. Positive values combine conditional + null-cond
+    predictions as ``eps = (1 + w) * eps_cond − w * eps_null``.
+    """
+    if device is None:
+        device = next(lightning_module.parameters()).device
+    lightning_module.eval()
+    lightning_module.to(device)
+    cond = cond.to(device)
+
+    alpha = lightning_module.alpha
+    sigma = lightning_module.sigma
+    T_loc = lightning_module.T
+
+    B = cond.shape[0]
+    r_t = torch.randn(B, data_dim, device=device)
+
+    use_cfg = float(guidance_w) > 0.0
+    if use_cfg:
+        null = lightning_module.null_cond.to(device).expand_as(cond)
+
+    for t in range(T_loc - 1, -1, -1):
+        t_batch  = torch.full((B,), t, dtype=torch.long, device=device)
+        eps_cond = lightning_module.model(r_t, t_batch, cond)
+        if use_cfg:
+            eps_null = lightning_module.model(r_t, t_batch, null)
+            eps_hat  = (1.0 + guidance_w) * eps_cond - guidance_w * eps_null
+        else:
+            eps_hat  = eps_cond
+
+        alpha_t = alpha[t]
+        sigma_t = sigma[t]
+        r_0_hat = (r_t - sigma_t * eps_hat) / alpha_t
+
+        if t > 0:
+            r_t = alpha[t - 1] * r_0_hat + sigma[t - 1] * eps_hat
+        else:
+            r_t = r_0_hat
+
+    return r_t * lightning_module.bin_stds.to(device) + lightning_module.bin_means.to(device)
+
+
+# ─── Task 65-helper — experiment-config-driven model factory ──────────────
+
+def build_model(
+    config: Dict,
+    total_cond_dim: int,
+    data_dim: int = 15,
+) -> nn.Module:
+    """Build the ε-predictor MLP described by an experiment ``config``.
+
+    Recognized keys (with defaults):
+
+        config["arch"]                : "concat" | "film"
+        config["consumed_keys"]       : list[str], dict-batch entries to concat
+        config["hidden_dim"]          : int, default 128
+        config["n_layers"]            : int, default 3
+        config["fourier"]             : bool, default False
+        config["fourier_n_freqs"]     : int, default 4
+        config["fourier_max_freq"]    : float, default 8.0
+        config["fourier_include_raw"] : bool, default True
+
+    Other keys (e.g. ``cond_dropout_p``) are ignored here; they belong
+    to the Lightning module.
+    """
+    arch         = str(config.get("arch", "concat"))
+    consumed     = list(config.get("consumed_keys", ["cond_base"]))
+    hidden_dim   = int(config.get("hidden_dim", 128))
+    n_layers     = int(config.get("n_layers", 3))
+    use_fourier  = bool(config.get("fourier", False))
+
+    fourier_mod = None
+    if use_fourier:
+        fourier_mod = FourierFeatureCondEmbedding(
+            cond_dim=total_cond_dim,
+            n_freqs=int(config.get("fourier_n_freqs", 4)),
+            max_freq=float(config.get("fourier_max_freq", 8.0)),
+            include_raw=bool(config.get("fourier_include_raw", True)),
+        )
+
+    if arch == "concat":
+        return ExtendedConcatConditionalDiffusionMLP(
+            data_dim=data_dim, cond_dim=total_cond_dim,
+            hidden_dim=hidden_dim, n_layers=n_layers,
+            consumed_keys=consumed, fourier=fourier_mod,
+        )
+    if arch == "film":
+        return FiLMConditionalDiffusionMLP(
+            data_dim=data_dim, cond_dim=total_cond_dim,
+            hidden_dim=hidden_dim, n_layers=n_layers,
+            consumed_keys=consumed, fourier=fourier_mod,
+        )
+    raise ValueError(f"unknown arch {arch!r}; expected 'concat' or 'film'")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Notebook helpers — generic plumbing for 10d / 10e
+# ══════════════════════════════════════════════════════════════════════════
+# These promote engineering boilerplate out of the student-facing
+# notebooks. Each helper preserves the behavior previously inlined in
+# the notebook cells; the science (experiment design, oracle MLP, NLL
+# math, plotting) stays in the notebook where students can author it.
+
+import os
+import sys
+
+
+def find_week10_artifacts(extra_required: Sequence[str] = ()) -> Dict[str, object]:
+    """Locate the standard Week-10 artifact paths and prep ``sys.path``.
+
+    Always required:
+      - unconditioned_infrastructure.py
+      - conditioned_infrastructure.py
+      - diffusion_windows.parquet
+      - butterflAI_model.py
+      - official_model.npz
+
+    Names passed in ``extra_required`` (e.g. ``"diffusion_windows_v2.parquet"``
+    or ``"data/composite_sunspot_groups_peak_area.csv"``) are also required.
+
+    Side effects:
+      - Inserts the repo root and the located ``week_08/09/10`` dirs on
+        ``sys.path`` so subsequent imports resolve.
+      - If ``conditioned_infrastructure`` was already imported from a
+        different file (e.g. a Week-09 stub), it is evicted from
+        ``sys.modules`` so the next import picks up the Week-10 file.
+
+    Returns
+    -------
+    dict
+        Keys: ``unconditioned_py``, ``conditioned_py``, ``parquet_v1``,
+        ``parquet_v2`` (None if not found), ``classical_py``,
+        ``classical_weights``, ``raw_csv`` (None if not found),
+        ``ckpt_conditional`` (None if not found), ``week10_dir``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any required artifact (default + ``extra_required``) is missing.
+    """
+    _cwd = os.getcwd()
+    _walk_bases = [_cwd] + [os.path.abspath(os.path.join(_cwd, *([".."] * i)))
+                            for i in range(1, 6)]
+
+    _week_dirs: List[str] = []
+    for _base in _walk_bases:
+        for _sub in [("weeks", "week_10"), ("weeks", "week_09"), ("weeks", "week_08")]:
+            _cand = os.path.join(_base, *_sub)
+            if os.path.isdir(_cand) and _cand not in _week_dirs:
+                _week_dirs.append(_cand)
+        if (any(w in _base for w in ("week_08", "week_09", "week_10"))
+                and os.path.isdir(_base) and _base not in _week_dirs):
+            _week_dirs.append(_base)
+
+    def _find_simple(filename: str) -> Optional[str]:
+        for d in _week_dirs:
+            p = os.path.join(d, filename)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _find_relative(rel: str) -> Optional[str]:
+        for _base in _walk_bases:
+            p = os.path.join(_base, rel)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _find_any(name: str) -> Optional[str]:
+        if "/" in name or "\\" in name:
+            return _find_relative(name)
+        return _find_simple(name)
+
+    required = [
+        "unconditioned_infrastructure.py",
+        "conditioned_infrastructure.py",
+        "diffusion_windows.parquet",
+        "butterflAI_model.py",
+        "official_model.npz",
+    ] + list(extra_required)
+
+    optional = [
+        "diffusion_windows_v2.parquet",
+        "data/composite_sunspot_groups_peak_area.csv",
+        "ckpt_conditional.ckpt",
+    ]
+
+    located: Dict[str, str] = {}
+    for name in list(required) + [n for n in optional if n not in required]:
+        p = _find_any(name)
+        if p is not None:
+            located[name] = p
+
+    missing = [n for n in required if n not in located]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot locate {missing}. Searched: {_week_dirs}"
+        )
+
+    cond_py    = located["conditioned_infrastructure.py"]
+    week10_dir = os.path.dirname(cond_py)
+    repo_root  = os.path.abspath(os.path.join(week10_dir, "..", ".."))
+
+    for _p in [repo_root, week10_dir,
+               os.path.dirname(located["unconditioned_infrastructure.py"]),
+               os.path.dirname(located["butterflAI_model.py"])]:
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+
+    if "conditioned_infrastructure" in sys.modules:
+        _existing = sys.modules["conditioned_infrastructure"]
+        if getattr(_existing, "__file__", None) != cond_py:
+            del sys.modules["conditioned_infrastructure"]
+
+    return {
+        "unconditioned_py":   located["unconditioned_infrastructure.py"],
+        "conditioned_py":     cond_py,
+        "parquet_v1":         located.get("diffusion_windows.parquet"),
+        "parquet_v2":         located.get("diffusion_windows_v2.parquet"),
+        "classical_py":       located["butterflAI_model.py"],
+        "classical_weights":  located["official_model.npz"],
+        "raw_csv":            located.get("data/composite_sunspot_groups_peak_area.csv"),
+        "ckpt_conditional":   located.get("ckpt_conditional.ckpt"),
+        "week10_dir":         week10_dir,
+    }
+
+
+class CondSampleQualityCallback(SampleQualityCallback):
+    """Sample-quality callback that draws from the CFG-capable extended
+    sampler. Each instance owns a fixed reference batch of cond vectors
+    (already concatenated and train-set-normalized) so the per-epoch
+    comparison is apples-to-apples across the run.
+    """
+
+    def __init__(self, train_samples, cond_reference, **kw):
+        super().__init__(train_samples, **kw)
+        self._cond_ref = cond_reference.detach().clone()
+
+    def _sample(self, pl_module):
+        device = next(pl_module.parameters()).device
+        return sample_conditional_extended(
+            pl_module, self._cond_ref, guidance_w=0.0, device=device,
+        ).cpu().numpy()
+
+
+def train_experiment(
+    name: str,
+    cfg: Dict,
+    windows_aug,
+    ckpt_dir: str,
+    wandb_project: str,
+    wandb_entity: Optional[str],
+    alpha_np,
+    sigma_np,
+    T: int,
+    bin_centers,
+    bin_width: float,
+    seed: int = 42,
+) -> str:
+    """Train one experiment to completion and save its checkpoint.
+
+    Skips training (without raising) if ``ckpt_dir/ckpt_<name>.ckpt``
+    already exists — the same idempotent discipline the 10d notebook
+    used inline. Falls back from WandB to a local ``CSVLogger`` if WandB
+    is unavailable.
+
+    Parameters
+    ----------
+    name : str
+        Experiment id; checkpoint file becomes ``ckpt_<name>.ckpt``.
+    cfg : dict
+        Experiment spec; see ``build_model`` for the recognized keys.
+        Additionally consumes ``groups``, ``consumed_keys``,
+        ``batch_size``, ``max_epochs``, ``lr``, ``cond_dropout_p``.
+    windows_aug : pandas.DataFrame
+        v2 parquet contents (train+val rows only).
+    ckpt_dir, wandb_project, wandb_entity : configuration.
+    alpha_np, sigma_np : diffusion schedule arrays.
+    T : int
+        Number of diffusion timesteps.
+    bin_centers, bin_width
+        Passed to the sample-quality callback for visual logging.
+    seed : int
+        Reproducibility seed.
+
+    Returns
+    -------
+    str
+        Absolute path to the saved checkpoint.
+    """
+    import pytorch_lightning as pl
+    from pytorch_lightning.loggers import WandbLogger, CSVLogger
+    try:
+        import wandb
+    except ImportError:
+        wandb = None
+    from infrastructure.utils.reproducibility import set_all_seeds
+
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_{name}.ckpt")
+    if os.path.isfile(ckpt_path):
+        print(f"[{name}] checkpoint exists at {ckpt_path}; skipping training.")
+        return ckpt_path
+
+    set_all_seeds(seed)
+
+    train_ds = ExtendedConditionalResidualDataset(windows_aug, "train",
+                                                  groups=cfg["groups"])
+    val_ds   = ExtendedConditionalResidualDataset(windows_aug, "val",
+                                                  groups=cfg["groups"],
+                                                  group_stats=train_ds.group_stats)
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=cfg["batch_size"], shuffle=True,  num_workers=0,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds,   batch_size=cfg["batch_size"], shuffle=False, num_workers=0,
+    )
+
+    total_dim = sum(train_ds.group_dims[k.replace("cond_", "")]
+                    for k in cfg["consumed_keys"])
+
+    model = build_model(cfg, total_cond_dim=total_dim)
+    lit = ExtendedConditionalDiffusionLightning(
+        model=model, alpha=alpha_np, sigma=sigma_np, T=T,
+        consumed_keys=cfg["consumed_keys"],
+        group_stats={g: train_ds.group_stats[g] for g in cfg["groups"]
+                     if f"cond_{g}" in cfg["consumed_keys"]},
+        total_cond_dim=total_dim,
+        bin_means=train_ds.bin_means, bin_stds=train_ds.bin_stds,
+        lr=cfg["lr"], scheduler="cosine", weight_decay=1e-4,
+        cond_dropout_p=cfg.get("cond_dropout_p", 0.0),
+    )
+
+    bin_means_np = train_ds.bin_means.numpy()
+    bin_stds_np  = train_ds.bin_stds.numpy()
+    all_tr_std   = torch.stack([train_ds[i]["r_clean"]
+                                for i in range(len(train_ds))]).numpy()
+    all_tr_phys  = all_tr_std * bin_stds_np + bin_means_np
+    all_va_std   = torch.stack([val_ds[i]["r_clean"]
+                                for i in range(len(val_ds))]).numpy()
+    all_va_phys  = all_va_std * bin_stds_np + bin_means_np
+    cond_ref = torch.cat(
+        [torch.stack([train_ds[i][k]
+                      for i in range(min(500, len(train_ds)))])
+         for k in cfg["consumed_keys"]],
+        dim=-1,
+    )
+
+    cb = CondSampleQualityCallback(
+        train_samples=all_tr_phys, val_samples=all_va_phys,
+        cond_reference=cond_ref,
+        every_n_epochs=200, n_compare=cond_ref.shape[0],
+        bin_centers=bin_centers, bin_width=bin_width,
+    )
+
+    try:
+        logger = WandbLogger(
+            project=wandb_project, entity=wandb_entity, name=name,
+            save_dir=os.path.join(ckpt_dir, "wandb_logs"),
+        )
+    except Exception as _e:
+        print(f"[{name}] WandB unavailable ({_e}); falling back to CSVLogger.")
+        logger = CSVLogger(os.path.join(ckpt_dir, "csv_logs"), name=name)
+
+    trainer = pl.Trainer(
+        max_epochs=cfg["max_epochs"], logger=logger,
+        accelerator="auto", devices="auto",
+        log_every_n_steps=10, enable_progress_bar=False,
+        callbacks=[cb],
+    )
+    trainer.fit(lit, train_loader, val_loader)
+    trainer.save_checkpoint(ckpt_path)
+    if wandb is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+    print(f"[{name}] saved {ckpt_path}")
+    return ckpt_path
+
+
+def load_trained_experiment(
+    name: str,
+    cfg: Dict,
+    windows_aug,
+    ckpt_dir: str,
+    alpha_np,
+    sigma_np,
+) -> Tuple[ExtendedConditionalDiffusionLightning, "ExtendedConditionalResidualDataset",
+           "ExtendedConditionalResidualDataset", int]:
+    """Rebuild the datasets and load the matching checkpoint into an
+    ``ExtendedConditionalDiffusionLightning`` for evaluation or
+    visualization. Returns ``(lit, train_ds, val_ds, total_cond_dim)``.
+    """
+    train_ds = ExtendedConditionalResidualDataset(windows_aug, "train",
+                                                  groups=cfg["groups"])
+    val_ds   = ExtendedConditionalResidualDataset(windows_aug, "val",
+                                                  groups=cfg["groups"],
+                                                  group_stats=train_ds.group_stats)
+    total_dim = sum(train_ds.group_dims[k.replace("cond_", "")]
+                    for k in cfg["consumed_keys"])
+
+    model = build_model(cfg, total_cond_dim=total_dim)
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_{name}.ckpt")
+    lit = ExtendedConditionalDiffusionLightning.load_from_checkpoint(
+        ckpt_path,
+        model=model, alpha=alpha_np, sigma=sigma_np,
+        group_stats={g: train_ds.group_stats[g] for g in cfg["groups"]
+                     if f"cond_{g}" in cfg["consumed_keys"]},
+        total_cond_dim=total_dim, consumed_keys=cfg["consumed_keys"],
+    )
+    return lit, train_ds, val_ds, total_dim
+
+
+def block_cond_concat(
+    hcs,
+    lit: ExtendedConditionalDiffusionLightning,
+    cfg: Dict,
+    train_ds: "ExtendedConditionalResidualDataset",
+) -> Tuple[List[Tuple[int, str, float]], torch.Tensor]:
+    """Build the concatenated, train-set-normalized cond tensor for every
+    block in ``hcs``, in ``cfg['consumed_keys']`` order.
+
+    ``hcs`` is a list of hemicycle dicts of the shape produced by 10c's
+    block builder; each block must carry a ``groups_raw`` dict keyed by
+    group name. The per-group means/stds are read from the loaded
+    checkpoint's buffers (``cond_<g>_means`` / ``cond_<g>_stds``) so the
+    val data is normalized exactly the way training was.
+
+    Returns ``(keys, cond_tensor)`` where ``keys`` is a list of
+    ``(cycle, hemisphere, center_decimal)`` block ids and
+    ``cond_tensor`` has shape ``(n_blocks, total_cond_dim)``.
+    """
+    keys: List[Tuple[int, str, float]] = []
+    rows: List[torch.Tensor] = []
+    for hc in hcs:
+        for blk in hc["blocks"]:
+            keys.append((hc["cycle"], hc["hemisphere"], blk["center_decimal"]))
+            parts: List[torch.Tensor] = []
+            for k in cfg["consumed_keys"]:
+                g     = k.replace("cond_", "")
+                raw   = torch.tensor(blk["groups_raw"][g], dtype=torch.float32)
+                means = getattr(lit, f"cond_{g}_means").cpu()
+                stds  = getattr(lit, f"cond_{g}_stds").cpu()
+                parts.append((raw - means) / stds)
+            rows.append(torch.cat(parts, dim=-1))
+    return keys, torch.stack(rows, dim=0)
+
+
+def k_run_combined(
+    hard_nll_combined,
+    classical,
+    hcs,
+    keys,
+    samples_NK15,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Push K residual samples per block through ``hard_nll_combined`` and
+    return per-K NLL and floor-fraction arrays.
+
+    Parameters
+    ----------
+    hard_nll_combined : callable
+        The hard-gated NLL primitive (defined in 10c / 10e), with the
+        signature ``hard_nll_combined(model, hcs, residuals_by_block) -> (nll, detail)``.
+    classical : ButterflAIModel
+        Fixed model passed through to ``hard_nll_combined`` (the
+        baseline whose hard gate is being preserved).
+    hcs : list
+        Hemicycle list whose ``blocks`` align with ``keys``.
+    keys : list of (cycle, hemisphere, center_decimal)
+        Block ids in the same row order as ``samples_NK15``.
+    samples_NK15 : numpy.ndarray
+        Array of shape ``(N_blocks, K, 15)`` of residual samples in
+        physical units.
+
+    Returns
+    -------
+    (nlls, floors) : tuple of numpy arrays, each shape ``(K,)``.
+    """
+    nlls, floors = [], []
+    for k in range(samples_NK15.shape[1]):
+        rbb = {key: samples_NK15[i, k] for i, key in enumerate(keys)}
+        nll, det = hard_nll_combined(classical, hcs, rbb)
+        nlls.append(nll)
+        floors.append(det["floor_fraction"])
+    return np.asarray(nlls), np.asarray(floors)
