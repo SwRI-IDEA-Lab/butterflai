@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
+import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 
 # Reuse Week 08 machinery unchanged — conditioning does not affect any of these.
@@ -1112,13 +1112,87 @@ def find_week10_artifacts(extra_required: Sequence[str] = ()) -> Dict[str, objec
     }
 
 
+# class CondSampleQualityCallback(SampleQualityCallback):
+#     """Sample-quality callback that draws from the CFG-capable extended
+#     sampler. Each instance owns a fixed reference batch of cond vectors
+#     (already concatenated and train-set-normalized) so the per-epoch
+#     comparison is apples-to-apples across the run.
+#     """
+
+    # def __init__(self, train_samples, cond_reference, **kw):
+    #     super().__init__(train_samples, **kw)
+    #     self._cond_ref = cond_reference.detach().clone()
+
+    # def _sample(self, pl_module):
+    #     device = next(pl_module.parameters()).device
+    #     return (
+    #         sample_conditional_extended(
+    #             pl_module,
+    #             self._cond_ref,
+    #             guidance_w=0.0,
+    #             device=device,
+    #         )
+    #         .cpu()
+    #         .numpy()
+    #     )
+        
+    # def on_train_epoch_end(self, trainer, pl_module):
+    #     if trainer.current_epoch % self.every != 0:
+    #         return
+    #     samples = self._sample(pl_module)
+    #     sample_std = samples.std(0)
+    #     sample_cov = np.cov(samples, rowvar=False)
+    #     std_mse  = float(np.mean((sample_std - self.train_arr.std(0)) ** 2))
+    #     cov_dist = float(np.linalg.norm(sample_cov - np.cov(self.train_arr, rowvar=False)))
+    #     pl_module.log("sample_std_mse",  std_mse)
+    #     pl_module.log("sample_cov_frob", cov_dist)
+    #     if self.val_arr is not None:
+    #         val_std_mse  = float(np.mean((sample_std - self.val_arr.std(0)) ** 2))
+    #         val_cov_dist = float(np.linalg.norm(sample_cov - np.cov(self.val_arr, rowvar=False)))
+    #         pl_module.log("val_sample_std_mse",  val_std_mse)
+    #         pl_module.log("val_sample_cov_frob", val_cov_dist)
+            
+    # def on_train_end(self, trainer, pl_module):
+    #     if not isinstance(trainer.logger, WandbLogger):
+    #         return
+    #     if self.bin_centers is None:
+    #         return
+    #     try:
+    #         import wandb
+    #     except ImportError:
+    #         return
+    #     samples = self._sample(pl_module)
+    #     rng = np.random.default_rng(0)
+    #     idx = rng.integers(0, len(self.train_arr), size=self.n)
+    #     train_np = self.train_arr[idx]
+    #     w = self.bin_width * 0.4
+    #     fig_mean, ax = plt.subplots(figsize=(9, 4))
+    #     ax.bar(self.bin_centers - w/2, train_np.mean(0), width=w, color="dodgerblue", label="training")
+    #     ax.bar(self.bin_centers + w/2, samples.mean(0), width=w, color="crimson", label="model samples")
+    #     ax.set_title("End-of-training: bin-wise mean")
+    #     ax.legend()
+    #     fig_mean.tight_layout()
+    #     fig_std, ax = plt.subplots(figsize=(9, 4))
+    #     ax.bar(self.bin_centers - w/2, train_np.std(0), width=w, color="dodgerblue", label="training")
+    #     ax.bar(self.bin_centers + w/2, samples.std(0), width=w, color="crimson", label="model samples")
+    #     ax.set_title("End-of-training: bin-wise std")
+    #     ax.legend()
+    #     fig_std.tight_layout()
+    #     trainer.logger.experiment.log({
+    #         "eval/binwise_mean": wandb.Image(fig_mean),
+    #         "eval/binwise_std": wandb.Image(fig_std),
+    #         "eval/end_of_training": float(trainer.current_epoch),
+    #         "trainer/global_step": trainer.global_step,
+    #     })
+    #     plt.close(fig_mean)
+    #     plt.close(fig_std)
+
 class CondSampleQualityCallback(SampleQualityCallback):
     """Sample-quality callback that draws from the CFG-capable extended
     sampler. Each instance owns a fixed reference batch of cond vectors
     (already concatenated and train-set-normalized) so the per-epoch
     comparison is apples-to-apples across the run.
     """
-
     def __init__(self, train_samples, cond_reference, **kw):
         super().__init__(train_samples, **kw)
         self._cond_ref = cond_reference.detach().clone()
@@ -1135,7 +1209,7 @@ class CondSampleQualityCallback(SampleQualityCallback):
             .cpu()
             .numpy()
         )
-        
+
     def on_train_epoch_end(self, trainer, pl_module):
         if trainer.current_epoch % self.every != 0:
             return
@@ -1152,6 +1226,44 @@ class CondSampleQualityCallback(SampleQualityCallback):
             pl_module.log("val_sample_std_mse",  val_std_mse)
             pl_module.log("val_sample_cov_frob", val_cov_dist)
 
+    def on_train_end(self, trainer, pl_module):
+        try:
+            from pytorch_lightning.loggers import WandbLogger
+        except ImportError:
+            return
+        if not isinstance(trainer.logger, WandbLogger):
+            return
+        if self.bin_centers is None:
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+        samples = self._sample(pl_module)
+        rng = np.random.default_rng(0)
+        idx = rng.integers(0, len(self.train_arr), size=self.n)
+        train_np = self.train_arr[idx]
+        w = self.bin_width * 0.4
+        fig_mean, ax = plt.subplots(figsize=(9, 4))
+        ax.bar(self.bin_centers - w/2, train_np.mean(0), width=w, color="dodgerblue", label="training")
+        ax.bar(self.bin_centers + w/2, samples.mean(0),  width=w, color="crimson",    label="model samples")
+        ax.set_title("End-of-training: bin-wise mean")
+        ax.legend()
+        fig_mean.tight_layout()
+        fig_std, ax = plt.subplots(figsize=(9, 4))
+        ax.bar(self.bin_centers - w/2, train_np.std(0), width=w, color="dodgerblue", label="training")
+        ax.bar(self.bin_centers + w/2, samples.std(0),  width=w, color="crimson",    label="model samples")
+        ax.set_title("End-of-training: bin-wise std")
+        ax.legend()
+        fig_std.tight_layout()
+        trainer.logger.experiment.log({
+            "eval/binwise_mean":    wandb.Image(fig_mean),
+            "eval/binwise_std":     wandb.Image(fig_std),
+            "eval/end_of_training": float(trainer.current_epoch),
+            "trainer/global_step":  trainer.global_step,
+        })
+        plt.close(fig_mean)
+        plt.close(fig_std)
 
 def train_experiment(
     name: str,
@@ -1291,6 +1403,7 @@ def train_experiment(
             name=name,
             save_dir=os.path.join(ckpt_dir, "wandb_logs"),
         )
+        logger.log_hyperparams(cfg) # add to log hyperparams for future reference, though the main experiment spec is in the name
     except Exception as _e:
         print(f"[{name}] WandB unavailable ({_e}); falling back to CSVLogger.")
         logger = CSVLogger(os.path.join(ckpt_dir, "csv_logs"), name=name)
