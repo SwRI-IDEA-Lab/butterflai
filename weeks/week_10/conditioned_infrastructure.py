@@ -1168,10 +1168,16 @@ def train_experiment(
         print(f"[{name}] WandB unavailable ({_e}); falling back to CSVLogger.")
         logger = CSVLogger(os.path.join(ckpt_dir, "csv_logs"), name=name)
 
+    # trainer = pl.Trainer(
+    #     max_epochs=cfg["max_epochs"], logger=logger,
+    #     accelerator="auto", devices="auto",
+    #     log_every_n_steps=10, enable_progress_bar=False,
+    #     callbacks=[cb],
+    # )
     trainer = pl.Trainer(
         max_epochs=cfg["max_epochs"], logger=logger,
         accelerator="auto", devices="auto",
-        log_every_n_steps=10, enable_progress_bar=False,
+        log_every_n_steps=10, enable_progress_bar=True,
         callbacks=[cb],
     )
     trainer.fit(lit, train_loader, val_loader)
