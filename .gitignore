@@ -214,3 +214,7 @@ __marimo__/
 *.png
 *.json
 *.csv
+*.ckpt
+wandb_logs/
+=*
+*.npz
