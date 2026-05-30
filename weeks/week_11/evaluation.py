@@ -113,6 +113,105 @@ def hard_nll_combined(model, hcs, residuals_by_block,
                  "floor_fraction": n_floored / max(n_lats, 1)}
 
 
+def hard_nll_combined_normalized(model, hcs, residuals_by_block, bin_centers,
+                                 bin_width=3.0, eps=1e-6):
+    """Renormalized counterpart of :func:`hard_nll_combined`.
+
+    Scores the same pointwise combined density ``p_cl + residual`` at the
+    observed latitudes, but divides it by its total mass on the 15-bin
+    support so the result is a *proper* (normalized) density NLL. This
+    adds ``+log(Z)`` per block, where
+
+        Z = sum_b max(eps, p_cl_bin[b] + residual[b]) * bin_width
+
+    and ``p_cl_bin`` is the classical density at the bin centers.
+
+    At guidance weight ``w == 0`` the generated residual integrates to ~0
+    and ``p_cl_bin`` cancels the classical part of the residual target
+    (``residual = emp - par``), so ``Z ~ 1`` and this reduces to
+    :func:`hard_nll_combined`. Under classifier-free guidance the residual
+    is amplified, ``Z`` grows, and ``+log(Z)`` cancels the artificial gain
+    that the un-normalized metric rewards (the leak that drives E6/E8 NLL
+    negative).
+
+    Parameters
+    ----------
+    model : ButterflAIModel
+    hcs : list of hemicycle dicts
+    residuals_by_block : dict
+        ``(cycle, hemisphere, center_decimal) -> (15,)`` residual densities.
+    bin_centers : array_like, shape (15,)
+        Latitude bin centers in degrees (e.g. ``[1.5, 4.5, ..., 43.5]``).
+    bin_width : float
+        Width of each latitude bin (degrees).
+    eps : float
+        Floor for both the pointwise density and the normalizer.
+
+    Returns
+    -------
+    (nll, details) with the keys of :func:`hard_nll_combined` plus
+    ``mean_added_mass`` (mean ``sum(residual)*bin_width``) and ``mean_logZ``.
+    """
+    bin_centers = np.asarray(bin_centers, dtype=float)
+    total, included, candidate = 0.0, 0, 0
+    n_floored, n_lats = 0, 0
+    sum_added_mass, sum_logZ = 0.0, 0.0
+    for hc in hcs:
+        A    = hc["amplitude"]
+        mu0A = float(model.mu_0(A))
+        for blk in hc["blocks"]:
+            candidate += 1
+            mu = float(model.mu(blk["tau"]))
+            if mu > mu0A:
+                continue
+            sigma = float(model.sigma(mu, A))
+            if sigma <= 0:
+                continue
+            key = (hc["cycle"], hc["hemisphere"], blk["center_decimal"])
+            if key not in residuals_by_block:
+                continue
+            residual = residuals_by_block[key]
+
+            lats   = blk["lats"]
+            p_cl   = sp_norm.pdf(lats, loc=mu, scale=sigma)
+            bin_ix = np.clip(np.floor(lats / bin_width).astype(int), 0, 14)
+            p_raw  = p_cl + residual[bin_ix]
+            p_comb = np.maximum(eps, p_raw)
+            n_floored += int((p_raw < eps).sum())
+            n_lats    += len(lats)
+
+            # Normalizer: total mass of the (floored) binned combined density.
+            p_cl_bin = sp_norm.pdf(bin_centers, loc=mu, scale=sigma)
+            comb_bin = np.maximum(eps, p_cl_bin + residual)
+            Z        = max(eps, float((comb_bin * bin_width).sum()))
+            logZ     = float(np.log(Z))
+
+            ll = np.log(p_comb).mean()
+            if not np.isfinite(ll) or not np.isfinite(logZ):
+                continue
+            total          -= (ll - logZ)
+            included       += 1
+            sum_added_mass += float((residual * bin_width).sum())
+            sum_logZ       += logZ
+    nll = total / included if included > 0 else float("inf")
+    return nll, {"included": included, "candidate": candidate,
+                 "coverage": included / max(candidate, 1),
+                 "floor_fraction": n_floored / max(n_lats, 1),
+                 "mean_added_mass": sum_added_mass / max(included, 1),
+                 "mean_logZ": sum_logZ / max(included, 1)}
+
+
+def project_residuals_zero_integral(residuals_by_block):
+    """Return a new residuals dict with each (15,) residual demeaned so its
+    integral over the 15 uniform bins is zero.
+
+    With uniform ``bin_width`` the constraint ``sum(r) * bin_width = 0`` is
+    equivalent to ``mean(r) = 0``, and the L2-optimal projection onto that
+    hyperplane is per-sample demeaning.
+    """
+    return {k: (v - v.mean()) for k, v in residuals_by_block.items()}
+
+
 # ---------------------------------------------------------------------------
 # Per-window evaluation block construction
 # ---------------------------------------------------------------------------
@@ -364,3 +463,168 @@ def fit_oracle(
 
     model.load_state_dict(best_state)
     return model, best_val_nll
+
+
+# ---------------------------------------------------------------------------
+# Metric-integrity & physical-plausibility diagnostics
+# ---------------------------------------------------------------------------
+
+def sample_diagnostics(samples_NK15, bin_stds_phys, bin_width=3.0):
+    """Metric-integrity diagnostics for a set of generated residual samples.
+
+    Both summaries use **robust** statistics (median, IQR) because
+    classifier-free guidance can produce a small fraction of extreme
+    samples whose magnitudes (~1e15) would dominate mean/std and make the
+    panel unreadable while saying nothing about typical behavior.
+
+    Parameters
+    ----------
+    samples_NK15 : numpy.ndarray, shape (N_blocks, K, 15)
+        Generated residual samples in physical (density) units.
+    bin_stds_phys : array_like, shape (15,)
+        Empirical per-bin residual spread (``train_ds.bin_stds``); used as
+        the natural reference scale for "healthy" sample diversity. The
+        Gaussian relation ``IQR ≈ 1.349·σ`` converts it to an IQR scale.
+    bin_width : float
+        Latitude bin width (degrees).
+
+    Returns
+    -------
+    dict with
+    ``added_mass`` : median over blocks*K of ``sum_b residual*bin_width``.
+        A faithful residual adds ~0 net mass; classifier-free guidance
+        inflates it (the leak the un-normalized NLL rewards).
+    ``diversity`` : median over blocks*bins of (across-K residual IQR ÷
+        empirical IQR scale). ~1 is healthy; ->0 signals mode collapse
+        under strong guidance.
+    """
+    s = np.asarray(samples_NK15, dtype=float)               # (N, K, 15)
+    added = float(np.median(s.sum(axis=-1) * bin_width))
+    per_bin_iqr = np.percentile(s, 75, axis=1) - np.percentile(s, 25, axis=1)
+    bin_stds = np.asarray(bin_stds_phys, dtype=float)
+    diversity = float(np.median(
+        per_bin_iqr / np.maximum(bin_stds * 1.349, 1e-12)
+    ))
+    return {"added_mass": added, "diversity": diversity}
+
+
+def assemble_butterfly(model, hc, mean_residual_by_block, bin_centers,
+                       eps=1e-6):
+    """Assemble a latitude-vs-time density map for one hemicycle.
+
+    Each window/block contributes one latitude column: the hard-gated
+    classical binned density plus the mean (over K) generated residual,
+    floored at *eps*. Blocks failing the hard gate (``mu > mu_0``) or
+    lacking a residual are skipped.
+
+    Parameters
+    ----------
+    model : ButterflAIModel
+    hc : dict
+        One hemicycle entry from :func:`build_eval_hemicycles`.
+    mean_residual_by_block : dict
+        ``(cycle, hemisphere, center_decimal) -> (15,)`` mean residual.
+    bin_centers : array_like, shape (15,)
+        Latitude bin centers (degrees).
+    eps : float
+
+    Returns
+    -------
+    (density_map, times) where ``density_map`` is ``(n_windows, 15)`` in
+    density units and ``times`` is ``(n_windows,)`` decimal years, both
+    sorted by time. Empty arrays if no block passes the gate.
+    """
+    bin_centers = np.asarray(bin_centers, dtype=float)
+    A    = hc["amplitude"]
+    mu0A = float(model.mu_0(A))
+    cols, times = [], []
+    for blk in hc["blocks"]:
+        mu = float(model.mu(blk["tau"]))
+        if mu > mu0A:
+            continue
+        sigma = float(model.sigma(mu, A))
+        if sigma <= 0:
+            continue
+        key = (hc["cycle"], hc["hemisphere"], blk["center_decimal"])
+        if key not in mean_residual_by_block:
+            continue
+        p_cl_bin = sp_norm.pdf(bin_centers, loc=mu, scale=sigma)
+        cols.append(np.maximum(eps, p_cl_bin + mean_residual_by_block[key]))
+        times.append(float(blk["center_decimal"]))
+    if not cols:
+        return np.empty((0, len(bin_centers))), np.empty((0,))
+    order = np.argsort(times)
+    return np.asarray(cols)[order], np.asarray(times)[order]
+
+
+def butterfly_physical_checks(density_map, times, bin_centers,
+                              lat_lo=5.0, lat_hi=40.0):
+    """Physical-plausibility checks on an assembled butterfly map.
+
+    Parameters
+    ----------
+    density_map : numpy.ndarray, shape (n_windows, 15)
+        Per-window latitude densities (output of :func:`assemble_butterfly`).
+    times : array_like, shape (n_windows,)
+        Decimal years per window.
+    bin_centers : array_like, shape (15,)
+        Latitude bin centers (degrees).
+    lat_lo, lat_hi : float
+        Spörer-zone bounds (deg) for the in-band mass fraction.
+
+    Returns
+    -------
+    dict with
+    ``sporer_slope`` : centroid-latitude slope vs time (deg/yr); negative
+        means equatorward drift, the physically expected sign.
+    ``sporer_ok`` : bool, ``sporer_slope < 0``.
+    ``in_band_fraction`` : mean fraction of per-window mass within
+        ``[lat_lo, lat_hi]``.
+    ``centroid_start`` / ``centroid_end`` : first/last window centroid lat.
+    """
+    bin_centers = np.asarray(bin_centers, dtype=float)
+    dm = np.asarray(density_map, dtype=float)
+    if dm.shape[0] < 2:
+        return {"sporer_slope": float("nan"), "sporer_ok": False,
+                "in_band_fraction": float("nan"),
+                "centroid_start": float("nan"), "centroid_end": float("nan")}
+    mass = dm.sum(axis=1)
+    centroid = (dm * bin_centers).sum(axis=1) / np.maximum(mass, 1e-12)
+    slope = float(np.polyfit(np.asarray(times, dtype=float), centroid, 1)[0])
+    in_band = (bin_centers >= lat_lo) & (bin_centers <= lat_hi)
+    in_band_frac = float(
+        (dm[:, in_band].sum(axis=1) / np.maximum(mass, 1e-12)).mean()
+    )
+    return {"sporer_slope": slope, "sporer_ok": slope < 0.0,
+            "in_band_fraction": in_band_frac,
+            "centroid_start": float(centroid[0]),
+            "centroid_end": float(centroid[-1])}
+
+
+def hemispheric_symmetry(checks_by_hc):
+    """Compare north/south plausibility for cycles present in both hemispheres.
+
+    Parameters
+    ----------
+    checks_by_hc : dict
+        ``(cycle, hemisphere) -> butterfly_physical_checks(...) dict``.
+
+    Returns
+    -------
+    dict ``cycle -> {slope_diff, in_band_diff}`` for cycles that have both
+    a 'north' and a 'south' entry. Empty if no cycle is paired (the val
+    split here is hemisphere-mixed, so pairing is often partial).
+    """
+    by_cycle = {}
+    for (cyc, hemi), d in checks_by_hc.items():
+        by_cycle.setdefault(cyc, {})[hemi] = d
+    out = {}
+    for cyc, hemis in by_cycle.items():
+        if "north" in hemis and "south" in hemis:
+            n, s = hemis["north"], hemis["south"]
+            out[cyc] = {
+                "slope_diff": abs(n["sporer_slope"] - s["sporer_slope"]),
+                "in_band_diff": abs(n["in_band_fraction"]
+                                    - s["in_band_fraction"]),
+            }
+    return out
