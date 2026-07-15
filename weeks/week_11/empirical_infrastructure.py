@@ -49,6 +49,7 @@ from conditioned_infrastructure import (
     _consumed_cond_dim,
     discover_experiment_checkpoints,
 )
+from unconditioned_infrastructure import SampleQualityCallback
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +179,9 @@ class EmpiricalDistributionDataset(torch.utils.data.Dataset):
         row_sum = mass.sum(axis=1, keepdims=True)
         row_sum = np.clip(row_sum, 1e-12, None)
         mass = mass / row_sum
+        # Normalized empirical density (1/deg), kept for the distributional
+        # validation metrics (the model's softmax output is compared to it).
+        self.emp_dens = (mass / self.bin_width).astype(np.float32)
         mass_smooth = laplace_smooth_mass(mass, alpha=alpha_smooth,
                                           n_pseudo=n_pseudo_obs)
 
@@ -291,6 +295,11 @@ class ExtendedConditionalEmpiricalDiffusionLightning(pl.LightningModule):
         logit_means=None,
         logit_stds=None,
         lambda_kl: float = 0.1,
+        bin_centers=None,
+        bin_width: float = 3.0,
+        lambda_band: float = 0.0,
+        band_lo: float = 5.0,
+        band_hi: float = 40.0,
         lr: float = 1e-3,
         scheduler: str = "cosine",
         weight_decay: float = 1e-4,
@@ -314,6 +323,10 @@ class ExtendedConditionalEmpiricalDiffusionLightning(pl.LightningModule):
         self.total_cond_dim = int(total_cond_dim)
         self.lambda_kl      = float(lambda_kl)
         self.kl_floor_eps   = float(kl_floor_eps)
+        self.bin_width      = float(bin_width)
+        self.lambda_band    = float(lambda_band)   # mass outside Spoerer band
+        self.band_lo        = float(band_lo)
+        self.band_hi        = float(band_hi)
 
         self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
         self.register_buffer("sigma", torch.as_tensor(sigma, dtype=torch.float32))
@@ -324,6 +337,14 @@ class ExtendedConditionalEmpiricalDiffusionLightning(pl.LightningModule):
               else torch.as_tensor(logit_stds,  dtype=torch.float32))
         self.register_buffer("logit_means", lm)
         self.register_buffer("logit_stds",  ls)
+
+        K = lm.shape[0]
+        bc = ((torch.arange(K, dtype=torch.float32) + 0.5) * self.bin_width
+              if bin_centers is None
+              else torch.as_tensor(bin_centers, dtype=torch.float32))
+        in_band = ((bc >= self.band_lo) & (bc <= self.band_hi)).to(torch.float32)
+        self.register_buffer("bin_centers", bc, persistent=False)
+        self.register_buffer("band_mask", in_band, persistent=False)
 
         self._group_names: List[str] = []
         for name, (means, stds) in group_stats.items():
@@ -358,20 +379,32 @@ class ExtendedConditionalEmpiricalDiffusionLightning(pl.LightningModule):
         eps_hat  = self.model(r_t, t, cond)
         mse_loss = F.mse_loss(eps_hat, eps)
 
-        if self.lambda_kl > 0.0:
-            x0_std        = (r_t - sigma_t * eps_hat) / alpha_t.clamp(min=1e-6)
-            logits        = x0_std * self.logit_stds + self.logit_means
-            p_model       = F.softmax(logits, dim=-1)
-            kl_per_sample = (
-                p_model * (torch.log(p_model + self.kl_floor_eps)
-                           - torch.log(m_classical + self.kl_floor_eps))
-            ).sum(dim=-1)
-            kl_loss = kl_per_sample.mean()
-            loss    = mse_loss + self.lambda_kl * kl_loss
-            self.log("mse_loss", mse_loss, on_step=False, on_epoch=True)
-            self.log("kl_loss",  kl_loss,  on_step=False, on_epoch=True)
-        else:
-            loss = mse_loss
+        loss = mse_loss
+
+        # Recover the predicted clean density once if any density-space term
+        # (KL anchor or Spoerer-band penalty) is active. The softmax output is
+        # already a normalized, non-negative probability mass, so — unlike the
+        # residual model — no mass-conservation/non-negativity terms are needed.
+        if self.lambda_kl > 0.0 or self.lambda_band > 0.0:
+            x0_std  = (r_t - sigma_t * eps_hat) / alpha_t.clamp(min=1e-6)
+            logits  = x0_std * self.logit_stds + self.logit_means
+            p_model = F.softmax(logits, dim=-1)
+
+            if self.lambda_kl > 0.0:
+                kl_per_sample = (
+                    p_model * (torch.log(p_model + self.kl_floor_eps)
+                               - torch.log(m_classical + self.kl_floor_eps))
+                ).sum(dim=-1)
+                kl_loss = kl_per_sample.mean()
+                loss    = loss + self.lambda_kl * kl_loss
+                self.log("mse_loss", mse_loss, on_step=False, on_epoch=True)
+                self.log("kl_loss",  kl_loss,  on_step=False, on_epoch=True)
+
+            if self.lambda_band > 0.0:
+                oob = (p_model * (1.0 - self.band_mask)).sum(dim=-1)  # mass
+                self.log("out_of_band_mass", oob.mean(),
+                         on_step=False, on_epoch=True)
+                loss = loss + self.lambda_band * (oob ** 2).mean()
 
         return loss
 
@@ -494,6 +527,66 @@ def sample_empirical_extended(
 EMP_CKPT_PREFIX = "ckpt_emp_"
 
 
+class EmpSampleQualityCallback(SampleQualityCallback):
+    """Distributional validation metrics for the logit/softmax model.
+
+    Mirrors ``CondSampleQualityCallback`` but draws from
+    ``sample_empirical_extended`` (whose output is already a normalized
+    density, so the model density needs no ``par`` reconstruction). When
+    ``val_emp``/``val_cond`` are supplied it logs ``val_emd``/``val_crps_mu``/…
+    in ``on_validation_epoch_end`` for model selection.
+    """
+
+    def __init__(self, train_samples, cond_reference,
+                 val_emp=None, val_cond=None, val_tau=None,
+                 n_eval_windows: int = 64, n_ensemble: int = 16, **kw):
+        super().__init__(train_samples, **kw)
+        self._cond_ref = cond_reference.detach().clone()
+        self._val_emp  = None if val_emp  is None else np.asarray(val_emp,  dtype=np.float32)
+        self._val_cond = None if val_cond is None else val_cond.detach().clone()
+        self._val_tau  = None if val_tau  is None else np.asarray(val_tau,  dtype=np.float32)
+        self._n_eval_windows = int(n_eval_windows)
+        self._n_ensemble     = int(n_ensemble)
+        self._eval_idx = None
+        if self._val_cond is not None:
+            n = self._val_cond.shape[0]
+            k = min(self._n_eval_windows, n)
+            self._eval_idx = np.random.default_rng(0).choice(n, size=k, replace=False)
+
+    def _sample(self, pl_module):
+        device = next(pl_module.parameters()).device
+        return sample_empirical_extended(
+            pl_module, self._cond_ref, guidance_w=0.0,
+            bin_width=self.bin_width, device=device,
+        ).cpu().numpy()
+
+    def _distributional_eval(self, trainer, pl_module):
+        if self._val_cond is None or self._val_emp is None:
+            return
+        from distribution_metrics import distributional_report
+
+        device = next(pl_module.parameters()).device
+        idx = self._eval_idx
+        M = self._n_ensemble
+        cond_rep = self._val_cond[idx].repeat_interleave(M, dim=0)
+        model_dens = sample_empirical_extended(
+            pl_module, cond_rep, guidance_w=0.0,
+            bin_width=self.bin_width, device=device,
+        ).cpu().numpy().reshape(len(idx), M, -1)            # (W, M, K) density
+
+        emp_dens = self._val_emp[idx]
+        tau = None if self._val_tau is None else self._val_tau[idx]
+        rep = distributional_report(
+            model_dens, emp_dens, self.bin_centers,
+            bin_width=self.bin_width, tau=tau,
+        )
+        for key in ("emd", "energy", "mu_mae", "sigma_mae", "skew_mae",
+                    "crps_mu", "crps_sigma"):
+            pl_module.log(f"val_{key}", float(rep[key]),
+                          on_step=False, on_epoch=True)
+        pl_module.train()
+
+
 def train_empirical_experiment(
     name: str,
     cfg: Dict,
@@ -568,8 +661,35 @@ def train_empirical_experiment(
         total_cond_dim=total_dim,
         logit_means=train_ds.logit_means, logit_stds=train_ds.logit_stds,
         lambda_kl=float(cfg.get("lambda_kl", 0.1)),
+        bin_centers=bin_centers, bin_width=bin_width,
+        lambda_band=float(cfg.get("lambda_band", 0.0)),
         lr=cfg["lr"], scheduler="cosine", weight_decay=1e-4,
         cond_dropout_p=cfg.get("cond_dropout_p", 0.0),
+    )
+
+    # Distributional validation metrics + selection on val EMD (not val_loss).
+    cond_ref = torch.cat(
+        [torch.stack([train_ds[i][k] for i in range(min(500, len(train_ds)))])
+         for k in cfg["consumed_keys"]], dim=-1,
+    )
+    val_cond = torch.cat(
+        [torch.stack([val_ds[i][k] for i in range(len(val_ds))])
+         for k in cfg["consumed_keys"]], dim=-1,
+    )
+    eval_every = cfg.get("eval_every_n_epochs", 200)
+    cb = EmpSampleQualityCallback(
+        train_samples=train_ds.emp_dens, cond_reference=cond_ref,
+        val_emp=val_ds.emp_dens, val_cond=val_cond,
+        n_eval_windows=cfg.get("n_eval_windows", 64),
+        n_ensemble=cfg.get("n_ensemble", 16),
+        every_n_epochs=eval_every, n_compare=cond_ref.shape[0],
+        bin_centers=bin_centers, bin_width=bin_width,
+    )
+    ckpt_cb = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(ckpt_dir, "select", name),
+        filename="best-{epoch}-{val_emd:.3f}",
+        monitor="val_emd", mode="min", save_top_k=1,
+        every_n_epochs=eval_every, save_last=True,
     )
 
     if wandb_project is not None:
@@ -588,8 +708,11 @@ def train_empirical_experiment(
         max_epochs=cfg["max_epochs"], logger=logger,
         accelerator="auto", devices="auto",
         log_every_n_steps=10, enable_progress_bar=enable_progress_bar,
+        callbacks=[cb, ckpt_cb],
+        check_val_every_n_epoch=eval_every,
     )
     trainer.fit(lit, train_loader, val_loader)
+    # Final-iterate checkpoint; the val_emd-best lives under select/<name>/.
     trainer.save_checkpoint(ckpt_path)
     if wandb is not None and wandb_project is not None:
         try:

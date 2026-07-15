@@ -14,6 +14,13 @@ from scipy.stats import norm as sp_norm
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from conditioned_infrastructure import ExtendedConditionalResidualDataset
+from distribution_metrics import (
+    distributional_report,
+    emd_density,
+    energy_distance_to_point,
+    density_moments,
+    crps_ensemble,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +513,55 @@ def sample_diagnostics(samples_NK15, bin_stds_phys, bin_width=3.0):
         per_bin_iqr / np.maximum(bin_stds * 1.349, 1e-12)
     ))
     return {"added_mass": added, "diversity": diversity}
+
+
+def distributional_scorecard(model_dens_by_block, emp_dens_by_block,
+                             bin_centers, bin_width=3.0, tau_by_block=None):
+    """Distributional goodness-of-fit scorecard over a set of windows.
+
+    Model-agnostic companion to the NLL primitives above: it takes
+    already-built **densities** (so it works identically for the classical
+    Gaussian, the residual model ``par + residual``, and the logit/softmax
+    model) and runs the full :mod:`distribution_metrics` suite — EMD, energy
+    distance, moment errors, CRPS, and the mean-latitude rank histogram. Pair
+    it with :func:`hard_nll_combined_normalized` for a fair NLL-vs-shape
+    comparison.
+
+    Parameters
+    ----------
+    model_dens_by_block : dict
+        ``block_key -> (M, 15)`` ensemble of model densities (1/deg). For a
+        deterministic model (e.g. the classical Gaussian) pass ``M = 1``.
+    emp_dens_by_block : dict
+        ``block_key -> (15,)`` empirical density for the same windows.
+    bin_centers : ndarray, shape (15,)
+    bin_width : float
+    tau_by_block : dict, optional
+        ``block_key -> tau`` for the drift arrays in the report.
+
+    Returns
+    -------
+    dict
+        The :func:`distribution_metrics.distributional_report` output over the
+        blocks present in both dicts, plus ``n_blocks``.
+    """
+    keys = [k for k in model_dens_by_block if k in emp_dens_by_block]
+    if not keys:
+        raise ValueError("no overlapping block keys between model and empirical densities")
+
+    M = max(np.atleast_2d(model_dens_by_block[k]).shape[0] for k in keys)
+    ens = np.stack([
+        np.broadcast_to(np.atleast_2d(model_dens_by_block[k]), (M, len(bin_centers)))
+        for k in keys
+    ]).astype(np.float64)                                    # (N, M, K)
+    emp = np.stack([np.asarray(emp_dens_by_block[k], dtype=np.float64) for k in keys])
+    tau = (None if tau_by_block is None
+           else np.array([tau_by_block[k] for k in keys], dtype=np.float64))
+
+    report = distributional_report(ens, emp, bin_centers,
+                                   bin_width=bin_width, tau=tau)
+    report["n_blocks"] = len(keys)
+    return report
 
 
 def assemble_butterfly(model, hc, mean_residual_by_block, bin_centers,
