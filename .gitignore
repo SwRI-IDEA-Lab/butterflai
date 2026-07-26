@@ -211,3 +211,10 @@ __marimo__/
 *.dat
 *.zip
 *.mat
+*.png
+*.json
+*.csv
+*.ckpt
+wandb_logs/
+=*
+*.npz
