@@ -218,3 +218,5 @@ __marimo__/
 wandb_logs/
 =*
 *.npz
+
+voice/
