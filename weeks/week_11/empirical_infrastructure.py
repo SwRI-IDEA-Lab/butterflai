@@ -33,6 +33,7 @@ Reuses (no edits)
 
 from __future__ import annotations
 
+import contextlib
 import os
 import numpy as np
 import torch
@@ -206,7 +207,16 @@ class EmpiricalDistributionDataset(torch.utils.data.Dataset):
         if "amplitude" not in df_split.columns:
             raise ValueError("df must carry 'amplitude' for the KL prior")
         taus = df_split["tau_center"].to_numpy(dtype=np.float32)
+        # `amplitude` is in MSH/1000 — the unit classical.sigma / mu_0 /
+        # mu_peak were fit on. Raw MSH would not raise here, it would just
+        # widen the prior by ~2x early in each cycle, so check explicitly.
         amps = df_split["amplitude"].to_numpy(dtype=np.float32)
+        if amps.size and float(np.max(np.abs(amps))) > 5.0:
+            raise ValueError(
+                f"'amplitude' peaks at {float(np.max(amps)):g}; the classical "
+                f"model expects MSH/1000, not raw MSH. Rebuild the parquet "
+                f"with weeks/week_08/08_Diffusion_forward_pass.ipynb."
+            )
         for i in range(len(df_split)):
             tau_i = float(taus[i])
             A_i   = float(amps[i])
@@ -723,6 +733,46 @@ def train_empirical_experiment(
     return ckpt_path
 
 
+@contextlib.contextmanager
+def _numpy_safe_globals():
+    """Allowlist numpy's array reconstructor for the duration of a
+    ``torch.load``.
+
+    ``bin_centers`` reaches ``save_hyperparameters`` as a numpy array, so it is
+    pickled into every ``ckpt_emp_*.ckpt``. From torch 2.6 ``torch.load``
+    defaults to ``weights_only=True``, whose unpickler rejects
+    ``numpy._core.multiarray._reconstruct`` and raises ``UnpicklingError``.
+    (The residual checkpoints are unaffected — none of their hyperparameters
+    is a numpy object.) Allowlisting exactly the numpy globals an ndarray
+    needs keeps the strict unpickler everywhere else, so a tampered checkpoint
+    still cannot execute arbitrary code.
+
+    A no-op on torch < 2.5, where ``safe_globals`` does not exist and
+    ``weights_only`` already defaults to False.
+    """
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is None:
+        yield
+        return
+    allow = [np.ndarray, np.dtype]
+    for path in ("numpy._core.multiarray", "numpy.core.multiarray"):
+        try:
+            mod = __import__(path, fromlist=["_reconstruct"])
+        except ImportError:
+            continue
+        for fn in ("_reconstruct", "scalar"):
+            obj = getattr(mod, fn, None)
+            if obj is not None:
+                allow.append(obj)
+    # numpy>=2 registers each concrete dtype as its own class.
+    dtypes_mod = getattr(np, "dtypes", None)
+    if dtypes_mod is not None:
+        allow += [getattr(dtypes_mod, n) for n in dir(dtypes_mod)
+                  if n.endswith("DType") and isinstance(getattr(dtypes_mod, n), type)]
+    with safe_globals(allow):
+        yield
+
+
 def load_trained_empirical_experiment(
     name: str,
     cfg: Dict,
@@ -760,13 +810,14 @@ def load_trained_empirical_experiment(
 
     model = build_model(cfg, total_cond_dim=total_dim)
     ckpt_path = os.path.join(ckpt_dir, f"{EMP_CKPT_PREFIX}{name}.ckpt")
-    lit = ExtendedConditionalEmpiricalDiffusionLightning.load_from_checkpoint(
-        ckpt_path,
-        model=model, alpha=alpha_np, sigma=sigma_np,
-        group_stats={g: train_ds.group_stats[g] for g in cfg["groups"]
-                     if f"cond_{g}" in cfg["consumed_keys"]},
-        total_cond_dim=total_dim, consumed_keys=cfg["consumed_keys"],
-    )
+    with _numpy_safe_globals():
+        lit = ExtendedConditionalEmpiricalDiffusionLightning.load_from_checkpoint(
+            ckpt_path,
+            model=model, alpha=alpha_np, sigma=sigma_np,
+            group_stats={g: train_ds.group_stats[g] for g in cfg["groups"]
+                         if f"cond_{g}" in cfg["consumed_keys"]},
+            total_cond_dim=total_dim, consumed_keys=cfg["consumed_keys"],
+        )
     return lit, train_ds, val_ds, total_dim
 
 
@@ -799,7 +850,7 @@ def hard_nll_direct(
     total, included, candidate = 0.0, 0, 0
     n_floored, n_lats = 0, 0
     for hc in hcs:
-        A    = hc["amplitude"]
+        A    = hc["amplitude"]       # MSH/1000, model units
         mu0A = float(model.mu_0(A))
         for blk in hc["blocks"]:
             candidate += 1
@@ -830,3 +881,139 @@ def hard_nll_direct(
     return nll, {"included": included, "candidate": candidate,
                  "coverage": included / max(candidate, 1),
                  "floor_fraction": n_floored / max(n_lats, 1)}
+
+
+# ---------------------------------------------------------------------------
+# Density transforms — empirical-target analogs of the residual-side
+# ``hard_nll_combined_normalized`` renormalization and of
+# ``project_residuals_zero_integral``.
+# ---------------------------------------------------------------------------
+
+def normalize_densities(p_density_by_block, bin_width: float = 3.0,
+                        eps: float = 1e-12):
+    """Divide each block's density by its own total mass ``Σ p·Δlat``.
+
+    Residual-side analog: :func:`evaluation.hard_nll_combined_normalized`,
+    which has to renormalize *inside* the NLL primitive because the density
+    being scored (``p_classical + residual``) is only formed there. Here the
+    sampler already emits the density, so the renormalization is a standalone
+    transform and composes with :func:`hard_nll_direct`.
+
+    For samples produced by :func:`sample_empirical_extended` this is a no-op
+    to float32 precision — the softmax decode puts every sample on the simplex
+    by construction. Applying it anyway is the point: it demonstrates that the
+    mass-inflation leak classifier-free guidance exploits on the residual side
+    cannot exist here.
+
+    Parameters
+    ----------
+    p_density_by_block : dict
+        ``block_key -> (15,)`` per-bin density (1/deg).
+    bin_width : float
+        Latitude bin width (degrees).
+    eps : float
+        Per-bin floor applied before the mass is computed, mirroring the
+        ``comb_bin = max(eps, ...)`` step inside
+        :func:`evaluation.hard_nll_combined_normalized`. It guarantees a
+        strictly positive normalizer even for a signed input, and is small
+        enough to leave softmax-decoded densities untouched.
+
+    Returns
+    -------
+    dict with the same keys, each value renormalized to integrate to 1.
+    """
+    out = {}
+    for key, p in p_density_by_block.items():
+        p = np.maximum(eps, np.asarray(p, dtype=float))
+        Z = max(eps, float(p.sum() * bin_width))
+        out[key] = p / Z
+    return out
+
+
+def project_densities_simplex(p_density_by_block, bin_width: float = 3.0,
+                              eps: float = 1e-12):
+    """Project each block's density onto the probability simplex: clip the
+    negative bins to zero, then renormalize to integrate to 1.
+
+    Residual-side analog: :func:`evaluation.project_residuals_zero_integral`,
+    which demeans each residual so ``∫r = 0`` — the constraint the true
+    residual ``hist_emp − hist_par`` must satisfy. The corresponding
+    constraint on a distribution is ``p ≥ 0`` and ``∫p = 1``, so that is what
+    this projects onto.
+
+    Like :func:`normalize_densities` this is a no-op on softmax-decoded
+    samples; it exists so the empirical scoreboard carries the same four
+    metric columns as the residual scoreboard and the two can be read side by
+    side without per-notebook special cases.
+
+    Parameters
+    ----------
+    p_density_by_block : dict
+        ``block_key -> (15,)`` per-bin density (1/deg).
+    bin_width : float
+    eps : float
+
+    Returns
+    -------
+    dict with the same keys, each value non-negative and integrating to 1.
+    """
+    out = {}
+    for key, p in p_density_by_block.items():
+        p = np.maximum(np.asarray(p, dtype=float), 0.0)
+        mass = float(p.sum() * bin_width)
+        out[key] = p / max(mass, eps)
+    return out
+
+
+def assemble_butterfly_direct(model, hc, mean_density_by_block, bin_centers,
+                              eps: float = 1e-6):
+    """Assemble a latitude-vs-time density map for one hemicycle from directly
+    generated densities.
+
+    Mirrors :func:`evaluation.assemble_butterfly` exactly — same ``mu > mu_0``
+    hard gate, same skip rules, same time ordering — but takes the model's
+    density as-is instead of adding it to the classical pedestal. Keeping the
+    gate identical is what makes the empirical butterfly panels line up
+    column-for-column with the residual ones in ``11b_evaluate.ipynb``.
+
+    Parameters
+    ----------
+    model : ButterflAIModel
+        Classical model, used only for the hard gate (the density itself does
+        not depend on it).
+    hc : dict
+        One hemicycle entry from :func:`evaluation.build_eval_hemicycles`.
+    mean_density_by_block : dict
+        ``(cycle, hemisphere, center_decimal) -> (15,)`` mean generated
+        density (1/deg).
+    bin_centers : array_like, shape (15,)
+        Latitude bin centers (degrees).
+    eps : float
+
+    Returns
+    -------
+    (density_map, times) where ``density_map`` is ``(n_windows, 15)`` in
+    density units and ``times`` is ``(n_windows,)`` decimal years, both
+    sorted by time. Empty arrays if no block passes the gate.
+    """
+    bin_centers = np.asarray(bin_centers, dtype=float)
+    A    = hc["amplitude"]          # MSH/1000, model units
+    mu0A = float(model.mu_0(A))     # ~23-27 deg; raises if A is raw MSH
+    cols, times = [], []
+    for blk in hc["blocks"]:
+        mu = float(model.mu(blk["tau"]))
+        if mu > mu0A:
+            continue
+        sigma = float(model.sigma(mu, A))
+        if sigma <= 0:
+            continue
+        key = (hc["cycle"], hc["hemisphere"], blk["center_decimal"])
+        if key not in mean_density_by_block:
+            continue
+        cols.append(np.maximum(eps, np.asarray(mean_density_by_block[key],
+                                               dtype=float)))
+        times.append(float(blk["center_decimal"]))
+    if not cols:
+        return np.empty((0, len(bin_centers))), np.empty((0,))
+    order = np.argsort(times)
+    return np.asarray(cols)[order], np.asarray(times)[order]

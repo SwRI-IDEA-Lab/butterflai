@@ -69,6 +69,11 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
 
     HIST_COLS = [f"hist_emp_{j:02d}" for j in range(15)]
     PAR_COLS  = [f"hist_par_{j:02d}" for j in range(15)]
+    # `amplitude` is MSH/1000 (model units, what ButterflAIModel consumes);
+    # the parquet also carries `amplitude_msh` for display. Both COND_COLS
+    # entries are standardized with train-split stats, so the choice of unit
+    # for `amplitude` is a no-op for the network — but keeping it in model
+    # units means the same column serves the conditioning and the classical.
     COND_COLS = ["area_smoothed", "mu_universal", "model_sigma", "amplitude"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
@@ -351,7 +356,7 @@ def sample_conditional(
 # resolves the legacy classes byte-for-byte.
 # ══════════════════════════════════════════════════════════════════════════
 
-from typing import Optional, Sequence, Dict, Tuple, List
+from typing import Optional, Sequence, Dict, Tuple, List, Iterable
 
 
 # ─── Task 60-helper — dict-of-groups dataset ──────────────────────────────
@@ -1500,6 +1505,172 @@ def k_run_combined(
         nlls.append(nll)
         floors.append(det["floor_fraction"])
     return np.asarray(nlls), np.asarray(floors)
+
+
+# Canonical run-name vocabulary. Conditioning groups are emitted in this
+# fixed order regardless of the order they appear in a spec, so two specs
+# with the same cond set always produce the same name.
+COND_NAME_ORDER: Tuple[str, ...] = ("cyclehemi", "opp", "traj")
+COND_NAME_TOKEN: Dict[str, str] = {"cyclehemi": "hemi", "opp": "opp", "traj": "traj"}
+
+
+def canonical_experiment_name(
+    cfg: Dict[str, object],
+    base_template: Optional[Dict[str, object]] = None,
+) -> str:
+    """Build a run name from an experiment spec, one knob per slot.
+
+    The name is ``<cond-set>_<arch>[_four][_guid][_h###][_L#]``:
+
+    - **cond-set** — ``base`` plus every added conditioning group in
+      ``COND_NAME_ORDER``, joined by ``+``. A ``traj`` group whose spec also
+      consumes ``cond_traj_valid`` (the validity mask) becomes ``trajv``.
+    - **arch** — always spelled out, ``cat`` (concat) or ``film``, so a name
+      can never silently omit the architecture it was trained with.
+    - **four** — Fourier lifting of the cond scalars (``fourier=True``).
+    - **guid** — classifier-free guidance (``cond_dropout_p > 0``). Named
+      ``guid`` rather than ``cfg``, which already means the spec dict itself.
+    - **h###/L#** — capacity, appended only when ``hidden_dim``/``n_layers``
+      differ from ``base_template``.
+
+    Because the name is derived from the spec rather than typed alongside it,
+    it cannot drift out of sync with the configuration it labels. Names are
+    used verbatim as checkpoint stems (``ckpt_<name>.ckpt``) and wandb run
+    names, so the token set is restricted to ``[A-Za-z0-9_+]``.
+
+    Parameters
+    ----------
+    cfg
+        One experiment spec (``arch``, ``groups``, ``consumed_keys``,
+        ``fourier``, ``cond_dropout_p``, and optionally the capacity keys).
+    base_template
+        Spec defaults; capacity knobs equal to these are left out of the name.
+        Defaults to ``hidden_dim=128``, ``n_layers=3``.
+
+    Returns
+    -------
+    str
+        The canonical run name, e.g. ``"base+opp_film_four_guid"``.
+    """
+    base_template = base_template or {"hidden_dim": 128, "n_layers": 3}
+    groups = list(cfg.get("groups", ["base"]))
+    consumed = list(cfg.get("consumed_keys", ["cond_base"]))
+
+    cond = ["base"] + [COND_NAME_TOKEN[g] for g in COND_NAME_ORDER if g in groups]
+    if "cond_traj_valid" in consumed and "traj" in cond:
+        cond[cond.index("traj")] = "trajv"
+
+    parts = ["+".join(cond), "film" if cfg.get("arch") == "film" else "cat"]
+    if cfg.get("fourier"):
+        parts.append("four")
+    if float(cfg.get("cond_dropout_p", 0.0)) > 0:
+        parts.append("guid")
+    for key, token in (("hidden_dim", "h"), ("n_layers", "L")):
+        if key in cfg and key in base_template and cfg[key] != base_template[key]:
+            parts.append(f"{token}{cfg[key]}")
+    return "_".join(parts)
+
+
+def build_experiment_registry(
+    specs: Sequence[Dict[str, object]],
+    base_template: Optional[Dict[str, object]] = None,
+) -> Dict[str, Dict[str, object]]:
+    """Key a list of experiment specs by their canonical names.
+
+    Raises ``ValueError`` if two specs collide on a name — which means either
+    a duplicated experiment, or two runs that differ only in a knob the
+    naming scheme does not encode (add a slot to
+    :func:`canonical_experiment_name` in that case).
+    """
+    registry: Dict[str, Dict[str, object]] = {}
+    for cfg in specs:
+        name = canonical_experiment_name(cfg, base_template)
+        if name in registry:
+            raise ValueError(
+                f"two specs map to the run name {name!r}: either a duplicate, "
+                f"or they differ in a knob the name does not encode.")
+        registry[name] = cfg
+    return registry
+
+
+# ─── Pre-rename checkpoint compatibility ──────────────────────────────────
+#
+# Experiments used to be keyed by opaque IDs (E0metrics, E4metrics, ...) that
+# said nothing about the config they labeled; they are now keyed by
+# canonical_experiment_name(). Checkpoints trained under the old IDs were
+# deliberately NOT renamed on disk, so this maps canonical name -> old file
+# stem to keep them loadable. Both the residual (``ckpt_<stem>.ckpt``) and
+# empirical (``ckpt_emp_<stem>.ckpt``) families used the same IDs.
+#
+# Delete an entry once its experiment has been retrained under the canonical
+# name, and delete the whole table once none of the old files are wanted.
+LEGACY_EXPERIMENT_STEMS: Dict[str, str] = {
+    "base_cat":                "E0metrics",
+    "base_film":               "E4metrics",
+    "base_cat_four":           "E12metrics",
+    "base_film_four":          "E13metrics",
+    "base_cat_guid":           "E14metrics",
+    "base_film_guid":          "E15metrics",
+    "base_cat_four_guid":      "E16metrics",
+    "base_film_four_guid":     "E17metrics",
+    "base+hemi_cat":           "E1metrics",
+    "base+opp_cat":            "E2metrics",
+    "base+traj_cat":           "E3metrics",
+    "base+opp_film":           "E5metrics",
+    "base+opp_film_guid":      "E6metrics",
+    "base+opp_film_four":      "E7metrics",
+    "base+opp_film_four_guid": "E8metrics",
+    "base+traj_film_four":     "E9metrics",
+    "base+opp+traj_film_four": "E10metrics",
+    "base+trajv_film_four":    "E11metrics",
+}
+
+
+def resolve_experiment_stems(
+    discovered: Iterable[str],
+    experiments: Dict[str, object],
+    legacy: Optional[Dict[str, str]] = None,
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Match discovered checkpoint stems to canonical experiment names.
+
+    A stem is scoreable if it *is* a canonical name in ``experiments``, or is
+    the pre-rename stem of one (see ``LEGACY_EXPERIMENT_STEMS``). A canonical
+    checkpoint always wins over a legacy one for the same experiment, so
+    retraining under the new name silently retires the old file.
+
+    Parameters
+    ----------
+    discovered
+        Checkpoint stems, e.g. the keys of
+        :func:`discover_experiment_checkpoints`.
+    experiments
+        The canonical registry, e.g. from :func:`build_experiment_registry`.
+    legacy
+        Canonical name -> old stem. Defaults to ``LEGACY_EXPERIMENT_STEMS``;
+        pass ``{}`` to ignore pre-rename checkpoints entirely.
+
+    Returns
+    -------
+    known : list of (canonical_name, on_disk_stem)
+        Sorted by canonical name. Load with the stem, label with the name.
+    unknown : list of str
+        Stems with no spec — other model families, or stale files.
+    """
+    legacy = LEGACY_EXPERIMENT_STEMS if legacy is None else legacy
+    stems = list(discovered)
+    stem_set = set(stems)
+
+    resolved: Dict[str, str] = {}
+    for name in experiments:
+        if name in stem_set:
+            resolved[name] = name
+        elif legacy.get(name) in stem_set:
+            resolved[name] = legacy[name]
+
+    claimed = set(resolved.values())
+    known = sorted(resolved.items())
+    unknown = [s for s in stems if s not in claimed]
+    return known, unknown
 
 
 def discover_experiment_checkpoints(

@@ -4,6 +4,19 @@ Provides:
 - NLL primitives (ported from 10c): hard_nll_classical, hard_nll_combined
 - Per-window evaluation block construction: build_eval_hemicycles
 - Oracle MLP diagnostic: OracleMLP, gaussian_nll, fit_oracle
+
+AMPLITUDE UNITS
+---------------
+Every hemicycle dict carries ``amplitude`` in **MSH/1000** — the unit
+``ButterflAIModel``'s amplitude regressions were fit on. It is read straight
+from the parquet's ``amplitude`` column, which the Week-08 build writes in
+that unit (``amplitude_msh`` holds the raw MSH value for display).
+
+Do not pass raw MSH to ``model.sigma`` / ``mu_0`` / ``mu_peak``: it does not
+raise a numerical error, it silently pushes ``mu_peak`` and ``mu_0`` to
+thousands of degrees, which makes the poleward arm of σ(μ) unreachable and
+disables the hard gate. ``build_eval_hemicycles`` guards against a stale
+parquet; ``ButterflAIModel`` guards at the call itself.
 """
 
 import numpy as np
@@ -13,6 +26,7 @@ import torch.nn as nn
 from scipy.stats import norm as sp_norm
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from butterflAI_model import A_REF
 from conditioned_infrastructure import ExtendedConditionalResidualDataset
 from distribution_metrics import (
     distributional_report,
@@ -277,10 +291,30 @@ def build_eval_hemicycles(
         windows_v2.groupby(["cycle", "hemisphere"])["split"]
         .agg(lambda s: s.iloc[0]).to_dict()
     )
+    # `amplitude` is in model units (MSH/1000); see the module docstring. A
+    # parquet built before that convention stored raw MSH, which every
+    # classical call downstream would consume silently — so reject it here,
+    # where the error message can name the fix, rather than deep inside
+    # model.mu_0().
     amp_lookup = (
         windows_v2.groupby(["cycle", "hemisphere"])["amplitude"]
         .agg("first").to_dict()
     )
+    _amp_max = max(amp_lookup.values()) if amp_lookup else 0.0
+    if _amp_max > 5.0:
+        raise ValueError(
+            f"parquet 'amplitude' column peaks at {_amp_max:g}, which looks "
+            f"like raw MSH. The classical model expects MSH/1000. Rebuild "
+            f"the parquet with weeks/week_08/08_Diffusion_forward_pass.ipynb."
+        )
+    # Human-readable companion, carried through for labels and printouts.
+    if "amplitude_msh" in windows_v2.columns:
+        amp_msh_lookup = (
+            windows_v2.groupby(["cycle", "hemisphere"])["amplitude_msh"]
+            .agg("first").to_dict()
+        )
+    else:
+        amp_msh_lookup = {k: v * A_REF for k, v in amp_lookup.items()}
 
     # Convert parquet tau_center → calendar year.
     _t0_by_hc = {
@@ -354,7 +388,7 @@ def build_eval_hemicycles(
             t0 = float(classical.lookup_t0(cyc, hemi))
         except KeyError:
             continue
-        A = float(amp_lookup[(cyc, hemi)])
+        A = float(amp_lookup[(cyc, hemi)])   # MSH/1000, model units
         dfh = raw_df[
             (raw_df["CYCLE"] == int(cyc)) & (raw_df["hemisphere"] == hemi)
         ]
@@ -364,7 +398,9 @@ def build_eval_hemicycles(
         hemicycles.append({
             "cycle": int(cyc),
             "hemisphere": hemi,
-            "amplitude": A,
+            "amplitude": A,                 # MSH/1000 — feed to the classical
+            # MSH — for labels and printouts only
+            "amplitude_msh": float(amp_msh_lookup[(cyc, hemi)]),
             "t0": t0,
             "split": split,
             "blocks": blocks,
@@ -591,8 +627,8 @@ def assemble_butterfly(model, hc, mean_residual_by_block, bin_centers,
     sorted by time. Empty arrays if no block passes the gate.
     """
     bin_centers = np.asarray(bin_centers, dtype=float)
-    A    = hc["amplitude"]
-    mu0A = float(model.mu_0(A))
+    A    = hc["amplitude"]          # MSH/1000, model units
+    mu0A = float(model.mu_0(A))     # ~23-27 deg; raises if A is raw MSH
     cols, times = [], []
     for blk in hc["blocks"]:
         mu = float(model.mu(blk["tau"]))
