@@ -387,13 +387,23 @@ class SampleQualityCallback(pl.Callback):
         self.every       = int(every_n_epochs)
         self.n           = int(n_compare)
 
+    # ── sampling hook (subclasses override for conditional sampling) ───────
+    def _sample(self, pl_module):
+        """Draw diagnostic samples in physical units. Subclasses override
+        this to route through a conditional/CFG sampler; the base class
+        uses the unconditional `sample()`."""
+        return sample(pl_module, batch_size=self.n,
+                      data_dim=self.train_arr.shape[1]).cpu().numpy()
+
     # ── periodic scalar diagnostics ────────────────────────────────────────
     def on_train_epoch_end(self, trainer, pl_module):
-        if trainer.current_epoch % self.every != 0:
+        # Match Lightning's `(epoch + 1) % every` cadence used by
+        # `check_val_every_n_epoch` and `ModelCheckpoint(every_n_epochs=...)`,
+        # so these scalar diagnostics land on the same epochs validation runs.
+        if (trainer.current_epoch + 1) % self.every != 0:
             return
-        samples = sample(pl_module, batch_size=self.n,
-                         data_dim=self.train_arr.shape[1]).cpu().numpy()
-        # sample() de-standardizes, so `samples` is in physical units.
+        samples = self._sample(pl_module)
+        # _sample() de-standardizes, so `samples` is in physical units.
 
         sample_std = samples.std(0)
         sample_cov = np.cov(samples, rowvar=False)
@@ -411,6 +421,32 @@ class SampleQualityCallback(pl.Callback):
 
         pl_module.train()
 
+    # ── validation-time distributional metrics (subclasses override) ───────
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Hook for distributional validation metrics used in model selection.
+
+        The base (unconditional) callback has no per-window empirical targets,
+        so it does nothing. Conditional subclasses override
+        ``_distributional_eval`` to draw an ensemble per validation window and
+        log selection metrics (e.g. ``val_emd``) that a ``ModelCheckpoint`` can
+        monitor — a far better stopping signal than the denoising ``val_loss``.
+        """
+        if getattr(trainer, "sanity_checking", False):
+            return
+        # Lightning fires validation (and `ModelCheckpoint`) when
+        # `(epoch + 1) % check_val_every_n_epoch == 0`. Gate the distributional
+        # suite on the same convention so `val_emd` is present in the logged
+        # metrics whenever the val_emd-monitoring checkpoint is evaluated —
+        # otherwise the two cadences are off by one and the checkpoint raises
+        # MisconfigurationException for a missing monitor key.
+        if (trainer.current_epoch + 1) % self.every != 0:
+            return
+        self._distributional_eval(trainer, pl_module)
+
+    def _distributional_eval(self, trainer, pl_module):
+        """No-op by default; overridden by conditional subclasses."""
+        return
+
     # ── end-of-training figure panels (WandB only) ─────────────────────────
     def on_train_end(self, trainer, pl_module):
         if not isinstance(trainer.logger, WandbLogger):
@@ -422,8 +458,7 @@ class SampleQualityCallback(pl.Callback):
         except ImportError:
             return
 
-        samples = sample(pl_module, batch_size=self.n,
-                         data_dim=self.train_arr.shape[1]).cpu().numpy()
+        samples = self._sample(pl_module)
 
         rng      = np.random.default_rng(0)
         idx      = rng.integers(0, len(self.train_arr), size=self.n)

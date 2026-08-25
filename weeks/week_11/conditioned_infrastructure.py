@@ -69,6 +69,11 @@ class ConditionalResidualDataset(torch.utils.data.Dataset):
 
     HIST_COLS = [f"hist_emp_{j:02d}" for j in range(15)]
     PAR_COLS  = [f"hist_par_{j:02d}" for j in range(15)]
+    # `amplitude` is MSH/1000 (model units, what ButterflAIModel consumes);
+    # the parquet also carries `amplitude_msh` for display. Both COND_COLS
+    # entries are standardized with train-split stats, so the choice of unit
+    # for `amplitude` is a no-op for the network — but keeping it in model
+    # units means the same column serves the conditioning and the classical.
     COND_COLS = ["area_smoothed", "mu_universal", "model_sigma", "amplitude"]
 
     def __init__(self, df, split: str, cond_means=None, cond_stds=None):
@@ -429,6 +434,11 @@ class ExtendedConditionalResidualDataset(torch.utils.data.Dataset):
         self.bin_stds  = residuals.std(dim=0).clamp(min=1e-6)
         self._residuals = (residuals - self.bin_means) / self.bin_stds
 
+        # Keep the classical (parametric) density per window so the training
+        # step can enforce non-negativity of the reconstructed empirical
+        # density ``emp = par + residual``.
+        self._par = torch.from_numpy(par)
+
         # Per-group standardization — train-split-only.
         if group_stats is None:
             df_train = df.loc[df["split"] == "train"]
@@ -470,7 +480,10 @@ class ExtendedConditionalResidualDataset(torch.utils.data.Dataset):
         return self._residuals.shape[0]
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        item: Dict[str, torch.Tensor] = {"r_clean": self._residuals[idx]}
+        item: Dict[str, torch.Tensor] = {
+            "r_clean": self._residuals[idx],
+            "par":     self._par[idx],
+        }
         for g in self.groups:
             item[f"cond_{g}"] = self._cond[g][idx]
             if g in self._valid:
@@ -673,11 +686,18 @@ class ExtendedConditionalDiffusionLightning(pl.LightningModule):
         cond_dropout_p: float = 0.0,
         bin_means=None,
         bin_stds=None,
+        bin_centers=None,
+        bin_width: float = 3.0,
+        lambda_mass: float = 0.0,
+        lambda_neg: float = 0.0,
+        lambda_band: float = 0.0,
+        band_lo: float = 5.0,
+        band_hi: float = 40.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=[
             "model", "alpha", "sigma",
-            "bin_means", "bin_stds",
+            "bin_means", "bin_stds", "bin_centers",
             "group_stats",
         ])
 
@@ -690,6 +710,15 @@ class ExtendedConditionalDiffusionLightning(pl.LightningModule):
         self.consumed_keys  = list(consumed_keys)
         self.total_cond_dim = int(total_cond_dim)
 
+        # Soft-constraint weights on the reconstructed empirical density
+        # ``emp = par + residual`` (all default to 0 → behavior unchanged).
+        self.bin_width   = float(bin_width)
+        self.lambda_mass = float(lambda_mass)   # zero-integral / mass conservation
+        self.lambda_neg  = float(lambda_neg)    # non-negativity of emp = par + r
+        self.lambda_band = float(lambda_band)   # mass outside the Spoerer band
+        self.band_lo     = float(band_lo)
+        self.band_hi     = float(band_hi)
+
         self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
         self.register_buffer("sigma", torch.as_tensor(sigma, dtype=torch.float32))
 
@@ -699,6 +728,16 @@ class ExtendedConditionalDiffusionLightning(pl.LightningModule):
                        else torch.as_tensor(bin_stds,  dtype=torch.float32))
         self.register_buffer("bin_means", bin_means_t)
         self.register_buffer("bin_stds",  bin_stds_t)
+
+        K = bin_means_t.shape[0]
+        bin_centers_t = ((torch.arange(K, dtype=torch.float32) + 0.5) * self.bin_width
+                         if bin_centers is None
+                         else torch.as_tensor(bin_centers, dtype=torch.float32))
+        # Non-persistent: derived constants, kept out of the state_dict so
+        # checkpoints trained before these constraints still load cleanly.
+        self.register_buffer("bin_centers", bin_centers_t, persistent=False)
+        in_band = ((bin_centers_t >= self.band_lo) & (bin_centers_t <= self.band_hi))
+        self.register_buffer("band_mask", in_band.to(torch.float32), persistent=False)
 
         # Per-group standardization buffers, named by group.
         self._group_names: List[str] = []
@@ -718,7 +757,8 @@ class ExtendedConditionalDiffusionLightning(pl.LightningModule):
     def _concat_cond(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         return torch.cat([batch[k] for k in self.consumed_keys], dim=-1)
 
-    def _shared_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _shared_step(self, batch: Dict[str, torch.Tensor],
+                     stage: str = "train") -> torch.Tensor:
         r_clean = batch["r_clean"]
         cond    = self._concat_cond(batch)
         B       = r_clean.shape[0]
@@ -735,16 +775,60 @@ class ExtendedConditionalDiffusionLightning(pl.LightningModule):
         sigma_t = rearrange(self.sigma[t], "b -> b 1")
         r_t     = alpha_t * r_clean + sigma_t * eps
 
-        eps_hat = self.model(r_t, t, cond)
-        return F.mse_loss(eps_hat, eps)
+        eps_hat  = self.model(r_t, t, cond)
+        mse_loss = F.mse_loss(eps_hat, eps)
+
+        loss = mse_loss + self._constraint_terms(batch, r_t, sigma_t,
+                                                  alpha_t, eps_hat, stage)
+        return loss
+
+    def _constraint_terms(self, batch, r_t, sigma_t, alpha_t, eps_hat,
+                          stage: str) -> torch.Tensor:
+        """Soft constraints + diagnostics on the reconstructed density.
+
+        Recovers the predicted clean residual in *physical* units, forms the
+        reconstructed empirical density ``emp = par + residual``, and returns
+        the (possibly zero) penalty to add to the loss. The constraint
+        diagnostics are always logged so they can be watched even when the
+        penalty weights are 0.
+        """
+        # Predicted clean residual, de-standardized to physical density units.
+        r0_std  = (r_t - sigma_t * eps_hat) / alpha_t.clamp(min=1e-6)
+        r0_phys = r0_std * self.bin_stds + self.bin_means     # (B, K)
+
+        # Mass added by the residual: sum_b r * bin_width. Proper residuals
+        # integrate to zero (emp and par are both normalized densities).
+        added_mass = (r0_phys * self.bin_width).sum(dim=-1)   # (B,)
+        mass_penalty = (added_mass ** 2).mean()
+        self.log(f"{stage}_residual_integral_abs",
+                 added_mass.abs().mean(), on_step=False, on_epoch=True)
+
+        penalty = self.lambda_mass * mass_penalty
+
+        if "par" in batch:
+            emp_hat = batch["par"] + r0_phys                  # (B, K)
+            neg     = torch.clamp(-emp_hat, min=0.0)          # density < 0
+            neg_penalty = (neg ** 2).mean()
+            self.log(f"{stage}_neg_density_frac",
+                     (emp_hat < 0).float().mean(), on_step=False, on_epoch=True)
+            penalty = penalty + self.lambda_neg * neg_penalty
+
+            # Mass placed outside the Spoerer band (±band_lo..band_hi deg).
+            emp_pos = torch.clamp(emp_hat, min=0.0)
+            oob = (emp_pos * (1.0 - self.band_mask) * self.bin_width).sum(dim=-1)
+            self.log(f"{stage}_out_of_band_mass",
+                     oob.mean(), on_step=False, on_epoch=True)
+            penalty = penalty + self.lambda_band * (oob ** 2).mean()
+
+        return penalty
 
     def training_step(self, batch, batch_idx):
-        loss = self._shared_step(batch)
+        loss = self._shared_step(batch, stage="train")
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = self._shared_step(batch)
+        loss = self._shared_step(batch, stage="val")
         self.log("val_loss", loss, on_step=False, on_epoch=True)
         return loss
 
@@ -798,6 +882,7 @@ def sample_conditional_extended(
     guidance_w: float = 0.0,
     data_dim: int = 15,
     device=None,
+    enforce_zero_integral: bool = False,
 ) -> torch.Tensor:
     """DDIM sampling with optional classifier-free guidance.
 
@@ -808,6 +893,13 @@ def sample_conditional_extended(
     ``guidance_w == 0`` reproduces the legacy `sample_conditional`
     behavior. Positive values combine conditional + null-cond
     predictions as ``eps = (1 + w) * eps_cond − w * eps_null``.
+
+    ``enforce_zero_integral`` projects each sampled residual onto the
+    zero-integral hyperplane (per-sample demean) so the generated residual
+    conserves mass exactly — ``emp = par + residual`` then integrates to the
+    same total as ``par``. With uniform bins this L2-optimal projection is just
+    subtracting the per-sample mean (cf. ``project_residuals_zero_integral`` in
+    ``evaluation``).
     """
     if device is None:
         device = next(lightning_module.parameters()).device
@@ -844,7 +936,10 @@ def sample_conditional_extended(
         else:
             r_t = r_0_hat
 
-    return r_t * lightning_module.bin_stds.to(device) + lightning_module.bin_means.to(device)
+    out = r_t * lightning_module.bin_stds.to(device) + lightning_module.bin_means.to(device)
+    if enforce_zero_integral:
+        out = out - out.mean(dim=-1, keepdim=True)
+    return out
 
 
 # ─── Task 65-helper — experiment-config-driven model factory ──────────────
@@ -1037,17 +1132,84 @@ class CondSampleQualityCallback(SampleQualityCallback):
     sampler. Each instance owns a fixed reference batch of cond vectors
     (already concatenated and train-set-normalized) so the per-epoch
     comparison is apples-to-apples across the run.
+
+    When per-window validation targets are supplied (``val_par``, ``val_emp``,
+    ``val_cond``), the callback also computes the full distributional suite
+    (EMD, energy distance, CRPS, moment errors) on the validation split in
+    ``on_validation_epoch_end`` and logs ``val_emd``/``val_crps_mu``/… as
+    model-selection signals. For each evaluated window it draws ``n_ensemble``
+    conditional samples and reconstructs model densities ``emp = par +
+    residual``.
     """
 
-    def __init__(self, train_samples, cond_reference, **kw):
+    def __init__(self, train_samples, cond_reference,
+                 val_par=None, val_emp=None, val_cond=None, val_tau=None,
+                 n_eval_windows: int = 64, n_ensemble: int = 16, **kw):
         super().__init__(train_samples, **kw)
         self._cond_ref = cond_reference.detach().clone()
+
+        self._val_par  = None if val_par  is None else np.asarray(val_par,  dtype=np.float32)
+        self._val_emp  = None if val_emp  is None else np.asarray(val_emp,  dtype=np.float32)
+        self._val_cond = None if val_cond is None else val_cond.detach().clone()
+        self._val_tau  = None if val_tau  is None else np.asarray(val_tau,  dtype=np.float32)
+        self._n_eval_windows = int(n_eval_windows)
+        self._n_ensemble     = int(n_ensemble)
+
+        # Fixed window subset so the metric is comparable across epochs.
+        self._eval_idx = None
+        if self._val_cond is not None:
+            n = self._val_cond.shape[0]
+            k = min(self._n_eval_windows, n)
+            self._eval_idx = np.random.default_rng(0).choice(n, size=k, replace=False)
 
     def _sample(self, pl_module):
         device = next(pl_module.parameters()).device
         return sample_conditional_extended(
             pl_module, self._cond_ref, guidance_w=0.0, device=device,
         ).cpu().numpy()
+
+    def _distributional_eval(self, trainer, pl_module):
+        if self._val_cond is None or self._val_par is None or self._val_emp is None:
+            return
+        from distribution_metrics import distributional_report
+
+        device = next(pl_module.parameters()).device
+        idx = self._eval_idx
+        M = self._n_ensemble
+
+        # Tile each selected window M times → one batched sampler call.
+        cond_sel = self._val_cond[idx]                       # (W, D)
+        cond_rep = cond_sel.repeat_interleave(M, dim=0)      # (W*M, D)
+        resid = sample_conditional_extended(
+            pl_module, cond_rep, guidance_w=0.0, device=device,
+        ).cpu().numpy().reshape(len(idx), M, -1)             # (W, M, K)
+
+        par = self._val_par[idx][:, None, :]                 # (W, 1, K)
+        model_dens = par + resid                             # emp = par + residual
+        emp_dens = self._val_emp[idx]                        # (W, K)
+        tau = None if self._val_tau is None else self._val_tau[idx]
+
+        rep = distributional_report(
+            model_dens, emp_dens, self.bin_centers,
+            bin_width=self.bin_width, tau=tau,
+        )
+        for key in ("emd", "energy", "mu_mae", "sigma_mae", "skew_mae",
+                    "crps_mu", "crps_sigma"):
+            pl_module.log(f"val_{key}", float(rep[key]),
+                          on_step=False, on_epoch=True)
+        pl_module.train()
+
+
+def _consumed_cond_dim(train_ds, key: str) -> int:
+    """Width contributed to the concatenated cond vector by one
+    ``consumed_keys`` entry. Validity flags (``cond_<group>_valid``) are
+    1-D 0/1 masks routed through ``consumed_keys`` like any other entry,
+    but they are not standardized groups, so they have no ``group_dims``
+    entry — they always contribute exactly one dimension.
+    """
+    if key.endswith("_valid"):
+        return 1
+    return train_ds.group_dims[key.replace("cond_", "")]
 
 
 def train_experiment(
@@ -1063,6 +1225,7 @@ def train_experiment(
     bin_centers,
     bin_width: float,
     seed: int = 42,
+    device: Optional["torch.device"] = None,
 ) -> str:
     """Train one experiment to completion and save its checkpoint.
 
@@ -1089,6 +1252,11 @@ def train_experiment(
         Passed to the sample-quality callback for visual logging.
     seed : int
         Reproducibility seed.
+    device : torch.device, optional
+        Which device to train on. If ``None`` (default), Lightning's
+        ``accelerator="auto", devices="auto"`` picks for you. Pass e.g.
+        ``torch.device("cuda:1")`` to pin training to a specific GPU; the
+        CUDA index selects which physical GPU Lightning uses.
 
     Returns
     -------
@@ -1122,7 +1290,7 @@ def train_experiment(
         val_ds,   batch_size=cfg["batch_size"], shuffle=False, num_workers=0,
     )
 
-    total_dim = sum(train_ds.group_dims[k.replace("cond_", "")]
+    total_dim = sum(_consumed_cond_dim(train_ds, k)
                     for k in cfg["consumed_keys"])
 
     model = build_model(cfg, total_cond_dim=total_dim)
@@ -1133,8 +1301,12 @@ def train_experiment(
                      if f"cond_{g}" in cfg["consumed_keys"]},
         total_cond_dim=total_dim,
         bin_means=train_ds.bin_means, bin_stds=train_ds.bin_stds,
+        bin_centers=bin_centers, bin_width=bin_width,
         lr=cfg["lr"], scheduler="cosine", weight_decay=1e-4,
         cond_dropout_p=cfg.get("cond_dropout_p", 0.0),
+        lambda_mass=cfg.get("lambda_mass", 0.0),
+        lambda_neg=cfg.get("lambda_neg", 0.0),
+        lambda_band=cfg.get("lambda_band", 0.0),
     )
 
     bin_means_np = train_ds.bin_means.numpy()
@@ -1152,11 +1324,37 @@ def train_experiment(
         dim=-1,
     )
 
+    # Per-window validation targets for the distributional selection metrics:
+    # classical density (par), reconstructed empirical density (par+residual),
+    # and the concatenated normalized cond, all aligned row-for-row.
+    val_par  = torch.stack([val_ds[i]["par"] for i in range(len(val_ds))]).numpy()
+    val_emp  = val_par + all_va_phys
+    val_cond = torch.cat(
+        [torch.stack([val_ds[i][k] for i in range(len(val_ds))])
+         for k in cfg["consumed_keys"]],
+        dim=-1,
+    )
+
     cb = CondSampleQualityCallback(
         train_samples=all_tr_phys, val_samples=all_va_phys,
         cond_reference=cond_ref,
-        every_n_epochs=200, n_compare=cond_ref.shape[0],
+        val_par=val_par, val_emp=val_emp, val_cond=val_cond,
+        n_eval_windows=cfg.get("n_eval_windows", 64),
+        n_ensemble=cfg.get("n_ensemble", 16),
+        every_n_epochs=cfg.get("eval_every_n_epochs", 200),
+        n_compare=cond_ref.shape[0],
         bin_centers=bin_centers, bin_width=bin_width,
+    )
+
+    # Model selection on the distributional metric (val EMD), NOT the denoising
+    # val_loss — the latter rises while sample quality improves. Checkpoint
+    # cadence is aligned to the eval cadence so val_emd is present when checked.
+    eval_every = cfg.get("eval_every_n_epochs", 200)
+    ckpt_cb = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(ckpt_dir, "select", name),
+        filename="best-{epoch}-{val_emd:.3f}",
+        monitor="val_emd", mode="min", save_top_k=1,
+        every_n_epochs=eval_every, save_last=True,
     )
 
     try:
@@ -1168,13 +1366,27 @@ def train_experiment(
         print(f"[{name}] WandB unavailable ({_e}); falling back to CSVLogger.")
         logger = CSVLogger(os.path.join(ckpt_dir, "csv_logs"), name=name)
 
+    # Resolve the requested device into Lightning's (accelerator, devices)
+    # pair. A specific CUDA device pins training to that GPU; otherwise let
+    # Lightning auto-detect (the prior, unconditional behavior).
+    if device is not None and torch.device(device).type == "cuda":
+        _dev = torch.device(device)
+        accelerator, devices = "gpu", [_dev.index if _dev.index is not None else 0]
+    elif device is not None and torch.device(device).type == "cpu":
+        accelerator, devices = "cpu", "auto"
+    else:
+        accelerator, devices = "auto", "auto"
+
     trainer = pl.Trainer(
         max_epochs=cfg["max_epochs"], logger=logger,
-        accelerator="auto", devices="auto",
+        accelerator=accelerator, devices=devices,
         log_every_n_steps=10, enable_progress_bar=False,
-        callbacks=[cb],
+        callbacks=[cb, ckpt_cb],
+        check_val_every_n_epoch=eval_every,
     )
     trainer.fit(lit, train_loader, val_loader)
+    # ``save_checkpoint`` writes the *final-iterate* weights; the val_emd-best
+    # checkpoint lives under ckpt_dir/select/<name>/ for selection-based use.
     trainer.save_checkpoint(ckpt_path)
     if wandb is not None:
         try:
@@ -1203,7 +1415,7 @@ def load_trained_experiment(
     val_ds   = ExtendedConditionalResidualDataset(windows_aug, "val",
                                                   groups=cfg["groups"],
                                                   group_stats=train_ds.group_stats)
-    total_dim = sum(train_ds.group_dims[k.replace("cond_", "")]
+    total_dim = sum(_consumed_cond_dim(train_ds, k)
                     for k in cfg["consumed_keys"])
 
     model = build_model(cfg, total_cond_dim=total_dim)
@@ -1244,11 +1456,14 @@ def block_cond_concat(
             keys.append((hc["cycle"], hc["hemisphere"], blk["center_decimal"]))
             parts: List[torch.Tensor] = []
             for k in cfg["consumed_keys"]:
-                g     = k.replace("cond_", "")
-                raw   = torch.tensor(blk["groups_raw"][g], dtype=torch.float32)
-                means = getattr(lit, f"cond_{g}_means").cpu()
-                stds  = getattr(lit, f"cond_{g}_stds").cpu()
-                parts.append((raw - means) / stds)
+                g   = k.replace("cond_", "")
+                raw = torch.tensor(blk["groups_raw"][g], dtype=torch.float32)
+                if k.endswith("_valid"):
+                    parts.append(raw)  # 0/1 mask, never standardized
+                else:
+                    means = getattr(lit, f"cond_{g}_means").cpu()
+                    stds  = getattr(lit, f"cond_{g}_stds").cpu()
+                    parts.append((raw - means) / stds)
             rows.append(torch.cat(parts, dim=-1))
     return keys, torch.stack(rows, dim=0)
 

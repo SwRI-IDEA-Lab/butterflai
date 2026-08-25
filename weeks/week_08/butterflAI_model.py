@@ -15,6 +15,20 @@ API
     mu0 = m.mu_0(A=1.5)                         # cap latitude (active gate)
     on  = m.is_active(A=1.5, tau=8.0)           # past μ₀ cutoff?
 
+AMPLITUDE UNITS — read this before calling anything that takes `A`
+------------------------------------------------------------------
+`A` is the hemicycle's peak 12-month-smoothed corrected area in **MSH/1000**,
+because that is the unit the amplitude regressions were fit in (see
+`08_bootstrap_fit.py`: `A_REF = 1000.0`, `amp_lookup[...] = seg.max() / A_REF`).
+Real hemicycles run A ≈ 0.08–0.32.
+
+Passing raw MSH (A ≈ 80–320) does NOT raise a numerical error — it silently
+pushes `mu_peak(A)` and `mu_0(A)` to thousands of degrees, which makes the
+poleward arm of σ(μ) unreachable and disables the `μ ≤ μ₀` hard gate. The
+symptom is a model that is ~2× too wide early in the cycle and correct late.
+Use `amplitude_from_msh()` to convert; `mu_peak`, `m_i` and `mu_0` now raise
+on out-of-range input rather than degrading quietly.
+
 τ ("standard year") is centred on the hemicycle's effective reference epoch:
 
     τ = decimal_year − t0_total(cycle, hemisphere)
@@ -38,6 +52,51 @@ import numpy as np
 from scipy.stats import norm as sp_norm
 
 DEFAULT_NPZ = Path(__file__).resolve().parent / "official_model.npz"
+
+# Amplitude reference. The model's amplitude regressions were fit on
+# peak_amplitude / A_REF; see 08_bootstrap_fit.py, which defines the same
+# constant. Keep the two in sync.
+A_REF: float = 1000.0
+
+# Largest amplitude, in model units, that any real hemicycle can plausibly
+# reach. Cycles 12–24 span A ≈ 0.08–0.32, so 5.0 leaves an order of magnitude
+# of headroom while still catching a raw-MSH value (A ≈ 80–320) immediately.
+A_MAX_MODEL_UNITS: float = 5.0
+
+
+def amplitude_from_msh(A_msh):
+    """Convert a peak amplitude in MSH to the model's amplitude unit.
+
+    Parameters
+    ----------
+    A_msh : float or array_like
+        Peak 12-month-smoothed hemispheric corrected area [MSH].
+
+    Returns
+    -------
+    numpy.ndarray
+        Amplitude in MSH/1000, the unit `mu_peak`, `m_i` and `mu_0` expect.
+    """
+    return np.asarray(A_msh, dtype=float) / A_REF
+
+
+def _check_amplitude(A):
+    """Raise if `A` is outside the range the amplitude regressions were fit on.
+
+    Guards against the MSH / MSH-1000 mix-up, which is otherwise silent: raw
+    MSH produces finite but meaningless mu_peak / mu_0 values rather than a
+    numerical failure.
+    """
+    A = np.asarray(A, dtype=float)
+    if np.any(np.abs(A) > A_MAX_MODEL_UNITS):
+        bad = float(np.max(np.abs(A)))
+        raise ValueError(
+            f"amplitude {bad:g} is outside the fitted range "
+            f"(|A| <= {A_MAX_MODEL_UNITS:g}, real hemicycles are 0.08-0.32). "
+            f"This usually means A was passed in MSH; divide by "
+            f"A_REF={A_REF:g} or use amplitude_from_msh()."
+        )
+    return A
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -120,16 +179,21 @@ class ButterflAIModel:
                                                d["boot_t0_total_hi"])}
 
     # ── Amplitude regressions ──────────────────────────────────────────
+    # All three take A in MSH/1000 (see module docstring) and raise on
+    # out-of-range input.
     def mu_peak(self, A):
-        A = np.asarray(A, dtype=float)
+        """Knee of σ(μ) [degrees].  `A` in MSH/1000."""
+        A = _check_amplitude(A)
         return self.params.a_mu_peak * A + self.params.b_mu_peak
 
     def m_i(self, A):
-        A = np.asarray(A, dtype=float)
+        """Poleward σ-arm slope [dimensionless].  `A` in MSH/1000."""
+        A = _check_amplitude(A)
         return self.params.a_m_i * A + self.params.b_m_i
 
     def mu_0(self, A):
-        A = np.asarray(A, dtype=float)
+        """Cap latitude of the hard gate [degrees].  `A` in MSH/1000."""
+        A = _check_amplitude(A)
         return self.params.a_mu0 * A + self.params.b_mu0
 
     # ── Mean path and spread ───────────────────────────────────────────
@@ -138,6 +202,7 @@ class ButterflAIModel:
         return self.params.a_mu * np.exp(-tau / self.params.b_mu)
 
     def sigma(self, mu_value, A):
+        """σ(μ) [degrees] for a hemicycle of amplitude `A` [MSH/1000]."""
         mu_value = np.asarray(mu_value, dtype=float)
         return piecewise_linear_sigma(
             mu_value,
@@ -149,9 +214,9 @@ class ButterflAIModel:
     def gaussian(self, A, tau):
         """Returns (μ, σ) of the |latitude| Gaussian at standard year τ.
 
-        Both inputs broadcast.  The hard gate at μ₀(A) is NOT applied here
-        — caller decides whether to gate.  Use `is_active` or `density`
-        for gated output.
+        Both inputs broadcast.  `A` is in MSH/1000.  The hard gate at μ₀(A)
+        is NOT applied here — caller decides whether to gate.  Use
+        `is_active` or `density` for gated output.
         """
         mu_t = self.mu(tau)
         sig_t = self.sigma(mu_t, A)
@@ -160,8 +225,8 @@ class ButterflAIModel:
     def density(self, A, tau, abs_lat):
         """p(|latitude| | A, τ).  Zero past μ₀(A) (hard gate).
 
-        All three inputs broadcast.  Use np.abs(latitude) for raw signed
-        latitudes — the model is symmetric.
+        All three inputs broadcast.  `A` is in MSH/1000.  Use
+        np.abs(latitude) for raw signed latitudes — the model is symmetric.
         """
         mu_t  = self.mu(tau)
         sig_t = self.sigma(mu_t, A)
@@ -171,7 +236,10 @@ class ButterflAIModel:
         return np.where(mu_t <= cap, pdf, 0.0)
 
     def is_active(self, A, tau):
-        """Boolean: is the hemicycle still emerging at standard year τ?"""
+        """Boolean: is the hemicycle still emerging at standard year τ?
+
+        `A` is in MSH/1000.
+        """
         return self.mu(tau) <= self.mu_0(A)
 
     # ── Reference-epoch lookup ─────────────────────────────────────────
@@ -276,6 +344,16 @@ def _demo():
         )
         m = ButterflAIModel(path)
         print(m)
+
+        # Amplitude-unit contract: model units in, MSH out of bounds.
+        assert 10.0 <= float(m.mu_peak(0.13)) <= 20.0, m.mu_peak(0.13)
+        try:
+            m.mu_peak(130.0)
+        except ValueError as exc:
+            print(f"  guard OK: mu_peak(130 MSH) -> ValueError ({exc})")
+        else:
+            raise AssertionError("mu_peak(130.0) should have raised")
+        assert float(amplitude_from_msh(130.0)) == 0.13
 
         A = 1.5
         taus = np.linspace(-1, 8, 6)

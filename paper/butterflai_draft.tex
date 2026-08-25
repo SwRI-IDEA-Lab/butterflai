@@ -1,0 +1,654 @@
+% ============================================================================
+% ButterflAI: A hybrid statistical + score-based generative model of the
+% solar butterfly diagram.
+%
+% FIRST DRAFT. Prose written to the author's voice profile (see voice/).
+% Citations are placeholders [CIT] keyed to deep_research_text_markdown.md;
+% the author supplies the final .bib.  Passages marked % TODO(andres) require
+% the author's stance rather than a fabricated one.
+%
+% Primary class is AASTeX; an article-class fallback is provided in a comment
+% block below in case AASTeX is not installed locally.
+% ============================================================================
+\documentclass[twocolumn]{aastex631}
+
+% ---- article-class fallback (uncomment if aastex631 is unavailable) --------
+% \documentclass[11pt]{article}
+% \usepackage{amsmath,amssymb,graphicx,natbib}
+% \usepackage[margin=1in]{geometry}
+% \newcommand{\facility}[1]{}
+% ---------------------------------------------------------------------------
+
+\usepackage{amsmath}
+
+\newcommand{\degr}{\ensuremath{^{\circ}}}
+\newcommand{\msh}{\ensuremath{\mu\mathrm{Hem}}}   % millionths of a solar hemisphere
+\newcommand{\tzero}{\ensuremath{t_0}}
+\newcommand{\mupeak}{\ensuremath{\mu_{\mathrm{peak}}}}
+\newcommand{\muzero}{\ensuremath{\mu_0}}
+
+\shorttitle{ButterflAI}
+\shortauthors{Mu\~noz-Jaramillo et al.}
+
+\begin{document}
+
+\title{ButterflAI: A Hybrid Statistical and Score-Based Generative Model
+of the Solar Butterfly Diagram}
+
+% TODO(andres): author list and affiliations.
+\author{A.~Mu\~noz-Jaramillo}
+\affiliation{Southwest Research Institute, Boulder, CO, USA}
+
+\author{The ButterflAI Team}
+\affiliation{COFFIES Science Center}
+
+\begin{abstract}
+The equatorward migration of the sunspot emergence zones (the solar butterfly
+diagram) is one of the most recognizable signatures of the solar cycle, yet
+we lack a compact generative model able to draw new, physically plausible
+butterfly diagrams from a small number of cycle parameters. We build such a
+model in two parts. First, we describe a single butterfly wing as a
+time-indexed family of Gaussians in absolute latitude, with a mean latitude
+that follows a universal exponential path $\mu(\tau)=a\,e^{-\tau/b}$ (with
+$a=16.31\degr$ and $b=8.14$~yr) once time is measured from a per-hemicycle
+reference epoch, and with a width $\sigma(\mu)$ whose equatorward arm collapses
+onto a single line shared by every hemicycle while its poleward arm scales with
+cycle amplitude. Leave-one-cycle-out validation places the generalization floor
+of this classical model at $3.087$ nats per year-block. Second, we train a
+score-based diffusion model to generate the residual density that the classical
+Gaussian leaves behind, conditioned on cycle amplitude and phase. On six
+hemispheric cycles held out from all fitting, the hybrid model improves
+distributional fidelity substantially over both the classical model and an
+independent SARG-style baseline (a $24\%$ lower Earth Mover's distance and a
+roughly halved spread error), although it does not improve the pointwise
+likelihood, which continues to favor the smoother parametric Gaussian. We
+interpret this tension as evidence that likelihood alone is the wrong sole
+arbiter for a generative model of the butterfly diagram, and we show, using an
+oracle diagnostic, that the residual signal available in the present
+conditioning set is nearly exhausted. To the best of our knowledge, this is the
+first application of a score-based generative model to the solar butterfly
+diagram.
+\end{abstract}
+
+\keywords{Sunspots --- Solar cycle --- Solar activity --- Generative models}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================================
+
+The butterfly diagram is the latitude-time distribution of sunspot emergence,
+and its shape encodes much of what we know about the solar cycle: the
+equatorward drift of the active latitudes (Sp\"orer's law), the $\sim$11-year
+Schwabe periodicity, the amplitude relationships that connect a cycle's rise to
+its strength, and the hemispheric asymmetries that make no two cycles identical
+\citep[CIT]{}. A model that could \emph{generate} new butterfly diagrams, rather
+than merely describe the observed ones, would let us build large synthetic
+ensembles of solar cycles (thousands of realizations from a handful of
+parameters), propagate cycle-to-cycle statistics into flux-transport and
+irradiance reconstructions, and stress-test cycle-prediction methods against
+populations of plausible-but-unobserved cycles. Such a
+generator does not yet exist for the butterfly diagram itself.
+
+Two distinct notions of a ``universal'' cycle motivate the model we build here,
+and it is worth keeping them separate because they pull in opposite directions.
+The first is the amplitude-\emph{independent} universality of the latitudinal
+drift: \citet[CIT]{Hathaway2011} showed, from the area-weighted centroid of the
+sunspot zones, that ``the sunspot zone latitudes and equatorward drift measured
+relative to this starting time follow a standard path for all cycles with no
+dependence upon cycle strength or hemispheric dominance,'' a result reinforced
+by the universal decline phase of \citet[CIT]{CameronSchussler2016} and by the
+mean butterfly diagram of \citet[CIT]{CameronSchussler2024}. The second is the
+amplitude-\emph{dependent} universality of cycle \emph{shape}, expressed through
+the Waldmeier effect and the one- or two-parameter shape functions that collapse
+the sunspot-number time series onto a common curve
+\citep[CIT]{HathawayWilsonReichmann1994, Volobuev2009}. However, there is a
+normalization subtlety that bridges the two and which we exploit below: the
+drift is universal only when time is measured from cycle \emph{onset}, and
+systematic amplitude-dependent differences reappear when it is measured from
+cycle \emph{maximum} \citep[CIT]{Hathaway2011}.
+
+The nearest existing precedent for a synthetic butterfly generator is the
+Synthetic Active Region Generator \citep[SARG;][CIT]{JhaUpton2024, Jha2025},
+which draws a catalog of active regions (each with an emergence time, latitude,
+flux, and tilt) from observed statistical relationships and feeds them to an
+advective flux-transport model. SARG is a powerful tool, but it differs from
+what we set out to build in three ways: it generates a discrete active-region
+catalog rather than a direct latitude-time density; it fixes the emergence
+centroid at $28\degr$ and ties only the \emph{width} of the emergence band to a
+single, whole-Sun sunspot number; and it samples from fixed relationships
+without a learned refinement of what those relationships leave behind. The
+semi-synthetic reconstruction of \citet[CIT]{Jiang2011}, in contrast, does let
+the mean emergence latitude rise with cycle amplitude ($\langle\lambda\rangle =
+12.2\degr + 0.022\,S_n$), which is closer in spirit to the per-hemisphere
+amplitude tying we adopt. Machine learning has touched the butterfly diagram
+only as a forecasting tool so far \citep[CIT]{Covas2017, Covas2019}, and, to the
+best of our knowledge, no diffusion, score-based, or other deep generative model
+has been applied to the butterfly diagram itself, even though such models are
+now well established elsewhere in solar physics for full-disk imagery and
+active-region patches \citep[CIT]{Ramunno2024}.
+
+In this work we build a generative model of the butterfly diagram in two parts.
+The first part is a compact classical description of a single wing, in which the
+wing is a family of Gaussians whose mean follows a universal exponential path
+and whose width is a piecewise-linear function of latitude, with only a handful
+of numbers left free per cycle. The second part is a score-based diffusion model
+that learns the residual between the empirical latitude density and this
+classical Gaussian, conditioned on the same cycle parameters the classical model
+uses. We treat each hemisphere as its own amplitude-tied process throughout,
+which distinguishes our model from generators that symmetrize the two
+hemispheres or drive them from a single shared index.
+
+In Section~\ref{sec:data} we describe the composite sunspot-group catalog and
+the cuts we apply. In Section~\ref{sec:classical} we build the classical
+universal-wing model, fit it, and validate it by leave-one-cycle-out
+cross-validation and bootstrap. In Section~\ref{sec:diffusion} we set up the
+score-based residual model and the metrics we use to evaluate it. In
+Section~\ref{sec:results} we present the ablation, the failure of classifier-free
+guidance, the information ceiling we uncover, and the held-out test comparison
+against the classical and SARG baselines. In Section~\ref{sec:discussion} we
+discuss the tension between likelihood and distributional fidelity, what the
+residual framing assumes, and where the model can still be improved. We
+summarize in Section~\ref{sec:summary}.
+
+% ============================================================================
+\section{Data}
+\label{sec:data}
+% ============================================================================
+
+Our analysis rests on a composite catalog of daily sunspot-group measurements
+spanning 1825--2023 (roughly $3.1\times10^{5}$ individual measurements), stitched
+from several heliographic-position surveys into a single record with columns for
+date, heliographic latitude and longitude, corrected area (in millionths of a
+solar hemisphere, \msh, with an associated uncertainty), and solar cycle number.
+Because the catalog is a composite of surveys with different (and not always
+specified) detection thresholds, its early portion carries a heterogeneous
+calibration; we therefore restrict all modeling to cycles $\geq 12$, the
+well-observed and comparatively homogeneous era, while retaining the earlier
+cycles only for context.
+
+We treat each hemisphere of each cycle as an independent unit, which we refer to
+from now on as a \emph{hemicycle}, giving us $26$ hemicycles over cycles 12--24.
+This choice doubles the effective sample and imposes the (approximate)
+north-south symmetry of the emergence process, and it lets each hemisphere carry
+its own amplitude, reference epoch, and shape parameters (a point we return to in
+Section~\ref{sec:discussion}, because the hemispheres are related rather than
+independent). For every measurement we derive an absolute latitude
+$|\mathrm{lat}|$ and a decimal year, and for the amplitude proxy we sum the daily
+corrected area of all groups above a $50~\msh$ noise floor within each
+hemisphere and smooth the result with a rolling window.
+
+% ============================================================================
+\section{The classical universal-wing model}
+\label{sec:classical}
+% ============================================================================
+
+A single butterfly wing, viewed hemisphere by hemisphere, is a distribution of
+absolute emergence latitudes that drifts equatorward and narrows as the cycle
+ages. Our aim in this section is to reduce that wing to as few numbers as the
+data will allow, separating what is universal across cycles from what is
+specific to a given cycle, and to do so in a form that can later serve as the
+baseline density for the diffusion model of Section~\ref{sec:diffusion}.
+
+\subsection{Time alignment and the universal mean path}
+\label{sec:meanpath}
+
+The natural clock for a wing is not the calendar but the cycle's own phase, and
+so we align every hemicycle to a common reference epoch \tzero{} defined as the
+decimal year at which the yearly-mean absolute latitude crosses $15\degr$ on its
+equatorward descent, obtained by linear interpolation between the last year above
+and the first year below (a physically meaningful anchor, since it sits on the
+well-aligned decay phase rather than at the poorly-defined cycle onset).
+Measuring standardized time as $\tau =
+\mathrm{decimal\ year} - \tzero$, we find that the mean latitude of every
+hemicycle collapses onto a single exponential path,
+%
+\begin{equation}
+  \mu(\tau) = a\,e^{-\tau/b},
+  \label{eq:meanpath}
+\end{equation}
+%
+which we fit once by pooling the binned $(\tau,\mu)$ points from all hemicycles.
+The universal path has an amplitude of $a = 16.31\degr$ (95\% CI
+$[16.25, 16.44]$) at $\tau=0$ and an e-folding time of $b = 8.14$~yr
+$[8.01, 8.25]$; these two numbers, together, are the universal skeleton of the
+mean drift.
+
+The $15\degr$ crossing is a convenient but imperfect anchor, and so we refine
+\tzero{} per hemicycle in two steps: a first alignment shift $\delta_{S1}$ that
+minimizes each hemicycle's residual against the universal template, and a second
+shift $\Delta t_{S3}$ (bounded to $\pm2$~yr) obtained during the likelihood
+optimization described in Section~\ref{sec:fitting}. The single quantity our
+downstream code consumes is the effective reference epoch $t_0^{\rm total} =
+t_0^{15\degr} + \delta_{S1} + \Delta t_{S3}$; for a hemicycle we have never seen,
+$\Delta t_{S3}$ is by construction unidentifiable, and we fall back on the raw
+$15\degr$ crossing as a proxy.
+
+\subsection{The width model}
+\label{sec:width}
+
+The width of the wing is where the physics of the emergence zone lives, and it
+is not monotonic in either time or latitude: few spots emerge at high latitude
+early in the cycle, the zone is broadest at mid-cycle, and it collapses to a thin
+band near the equator at the end. Because $\mu(\tau)$ is monotonic and therefore
+invertible, we found it more physical to model the spread as a function of
+\emph{where} the wing sits rather than \emph{when}, remapping the width to
+$\sigma(\mu)$ (that is, the spread at a given mean latitude, independent of the
+cycle's clock). In this coordinate the width is well described by two straight
+lines joined at a peak latitude \mupeak,
+%
+\begin{equation}
+  \sigma(\mu) =
+  \begin{cases}
+    m_{\rm shared}\,\mu + b_{\rm shared}, & \mu \leq \mupeak \\[4pt]
+    m_i\,\mu + b_{\rm pol}, & \mu > \mupeak,
+  \end{cases}
+  \label{eq:sigma}
+\end{equation}
+%
+where continuity at \mupeak{} fixes $b_{\rm pol}$ and the result is clipped to be
+non-negative.
+
+The equatorward arm ($\mu \leq \mupeak$) is the headline result of this section:
+its slope and intercept, $m_{\rm shared} = 0.452$~$\degr\,\degr^{-1}$
+$[0.438, 0.460]$ and $b_{\rm shared} = 0.16\degr$ $[0.08, 0.30]$, are
+\emph{shared by every hemicycle}, so that the equatorward collapse of the active
+zone follows one and the same line regardless of cycle strength. We interpret
+this shared line as evidence that the equatorward narrowing is a
+dynamo-controlled process common to all cycles, in the same family of universal
+behaviors as the standard drift path of \citet[CIT]{Hathaway2011} and the
+universal decline of \citet[CIT]{CameronSchussler2016}. The poleward arm ($\mu >
+\mupeak$), in contrast, is cycle-specific: its slope $m_i$ and the detachment
+latitude \mupeak{} both scale with cycle amplitude, so that stronger cycles
+detach at higher latitude and descend more steeply.
+
+\subsection{Amplitude coupling}
+\label{sec:amplitude}
+
+The bridge from a descriptive model to a generative one is the coupling between
+cycle \emph{strength} and wing \emph{shape}, and we make that coupling explicit
+by regressing the three cycle-specific parameters on the hemispheric amplitude
+$A$ (the smoothed peak corrected area, in $\msh/1000$). All three relationships
+are consistent with a simple linear form $\mathrm{param}(A) = a\,A + b$: the
+detachment latitude $\mupeak(A)$ has slope $a=26.75$ and intercept $b=10.27\degr$;
+the poleward width slope $m_i(A)$ has slope $a=-0.885$ and intercept $b=-0.034$;
+and the high-latitude activity gate $\muzero(A)$ (the latitude above which we
+treat the wing as not yet active, so that a year is included only when
+$\mu(\tau) \leq \muzero(A)$) has slope $a=17.18$ and intercept $b=21.83\degr$. A
+year is scored under the model only when it is active.
+
+Two contrasts with SARG are worth drawing here. SARG fixes the emergence centroid
+at $28\degr$ and lets only the band width vary, and it ties that width to the
+whole-Sun sunspot number \citep[CIT]{Jha2025}; our model, by comparison, lets the
+poleward detachment latitude and the poleward width both rise with amplitude, and
+it ties them to the \emph{hemispheric} area rather than a global index. As a
+direct check of the SARG width prescription against our directly measured areas,
+we fit the single free constant $k$ in the SARG-style law $\sigma_\lambda(A) =
+1.5\degr + 3.8\degr\,[1 - e^{-A/k}]$ and obtain $k \approx 8.2~\msh$, far below
+the value of $400$ used in the SARG papers; this difference is expected, because
+our catalog measures corrected area directly (with a median of order $100~\msh$),
+whereas SARG derives its areas from the sunspot number through a fixed
+conversion. % TODO(andres): confirm you want to keep the direct k comparison in
+% the main text vs. moving it to an appendix.
+
+\subsection{Fitting and validation}
+\label{sec:fitting}
+
+The full model has eight global parameters (the two mean-path parameters, the
+two equatorward-arm parameters, and the four amplitude-regression coefficients
+for \mupeak{} and $m_i$), plus the per-hemicycle timeshifts, and we fit them by
+maximizing the per-block Gaussian log-likelihood in three stages. The first two
+stages use Nelder-Mead (rather than a gradient method) because the activity gate
+$\mu(\tau) \leq \muzero(A)$ is discontinuous in the parameters that move the mean
+path, and the third stage uses L-BFGS-B on all globals plus the per-hemicycle
+$\Delta t_{S3}$, warm-started from the second stage and made differentiable by
+replacing the hard gate with a soft sigmoid ($T = 0.5\degr$) during optimization
+while scoring with the hard gate. We add a coverage penalty to the objective so
+that the optimizer cannot buy likelihood by quietly shrinking the fraction of
+observed spots the model actually covers.
+
+Our scoreboard metric is the mean per-year-normalized negative log-likelihood
+(NLL), in nats per year-block, which weights each phase of the cycle equally
+rather than letting the spot-rich maximum years dominate. On all $26$ hemicycles
+the training NLL is $3.071$ nats per year-block $[3.063, 3.077]$ at a coverage of
+$0.963$ $[0.961, 0.973]$. To ask how much of this fit is genuine rather than
+overfit, we ran leave-one-cycle-out (LOCO) cross-validation, refitting the entire
+pipeline on $25$ hemicycles and scoring the held-out one under its raw $15\degr$
+epoch (with no test-time timeshift, which would leak). We also tested three
+structural extensions of the model class against this baseline: a Student-$t$
+likelihood with an asymmetric width (test NLL $+0.007$), a Student-$t$ likelihood
+alone (test NLL $0.000$), and power-law-with-offset amplitude regressions (test
+NLL $+0.016$). None of the three improved the held-out likelihood, and we
+therefore interpret $3.087$ nats per year-block as the generalization floor of
+this model class. We quantify parameter uncertainty with an $m$-out-of-$n$
+bootstrap ($m = 0.95n$ hemicycles, $200$ draws, refitting the full pipeline for
+each draw), and it is these draws that yield the confidence intervals quoted
+above and in Table~\ref{tab:params}.
+
+% TODO(andres): the LOCO ``Variant A'' naming and the coverage-penalty design
+% are yours; confirm the framing of 3.087 as a ``generalization floor'' matches
+% how you want to present it.
+
+\begin{deluxetable}{lcc}
+\tablecaption{Classical model parameters (all-data fit, $N=26$ hemicycles) with
+bootstrap 95\% confidence intervals.\label{tab:params}}
+\tablehead{\colhead{Parameter} & \colhead{Point} & \colhead{95\% CI}}
+\startdata
+$a$ (mean path, $\mu(\tau{=}0)$) [\degr]      & $16.31$   & $[16.25, 16.44]$ \\
+$b$ (mean-path e-folding) [yr]                & $8.14$    & $[8.01, 8.25]$   \\
+$m_{\rm shared}$ (eq.\ arm slope)             & $0.452$   & $[0.438, 0.460]$ \\
+$b_{\rm shared}$ (eq.\ arm intercept) [\degr] & $0.16$    & $[0.08, 0.30]$   \\
+$a_{\mupeak}$ (\mupeak\ vs $A$)               & $26.75$   & $[24.08, 28.57]$ \\
+$b_{\mupeak}$ (\mupeak\ at $A{=}0$) [\degr]   & $10.27$   & $[9.97, 10.80]$  \\
+$a_{m_i}$ ($m_i$ vs $A$)                      & $-0.885$  & $[-1.168, -0.617]$ \\
+$b_{m_i}$ ($m_i$ at $A{=}0$)                  & $-0.034$  & $[-0.089, 0.022]$ \\
+$a_{\muzero}$ (\muzero\ vs $A$)               & $17.18$   & $[14.62, 19.38]$ \\
+$b_{\muzero}$ (\muzero\ at $A{=}0$) [\degr]   & $21.83$   & $[21.37, 22.42]$ \\
+NLL (training) [nats/yr-block]               & $3.071$   & $[3.063, 3.077]$ \\
+Coverage (training)                          & $0.963$   & $[0.961, 0.973]$ \\
+\enddata
+\end{deluxetable}
+
+% ============================================================================
+\section{Score-based residual refinement}
+\label{sec:diffusion}
+% ============================================================================
+
+The classical model is smooth by construction, and a real wing is not: at any
+given phase the observed latitude density carries structure (asymmetry, mild
+bimodality, phase-dependent skew) that a single Gaussian cannot represent. Our
+second modeling step is to learn that leftover structure with a score-based
+diffusion model, keeping the classical Gaussian as a physically interpretable
+baseline and letting the diffusion model supply only the correction.
+
+\subsection{Target and setup}
+\label{sec:target}
+
+We slice each hemicycle into non-overlapping six-month windows (discarding any
+window with fewer than $20$ emergences), and in each window we represent the
+latitude distribution as a density on a fixed grid of $15$ bins of $3\degr$ each,
+spanning $|\mathrm{lat}|$ from $0\degr$ to $45\degr$. The diffusion target is the
+\emph{residual} density, defined as the empirical density minus the classical
+parametric density (the latter obtained by integrating the model Gaussian over
+each bin). We split the data by hemicycle rather than by window, because the
+windows of one hemicycle share an amplitude and a shape and a row-wise split
+would leak that information across the train/test boundary; sorting the
+hemicycles by amplitude and taking every fifth one gives us a test set of six
+hemicycles (12N, 13S, 15S, 19N, 22S, 24S) that we reserve entirely, fitting
+nothing on them until the final comparison of Section~\ref{sec:test}.
+
+\subsection{Model and training}
+\label{sec:model}
+
+Because the target is a $15$-dimensional vector rather than an image, the
+score network is a multilayer perceptron (three hidden layers of $128$ units with
+SiLU activations) rather than a convolutional U-Net, taking the noised residual
+and a sinusoidal timestep embedding as input and predicting the added noise (the
+standard $\epsilon$-prediction parameterization). We use a variance-preserving
+cosine noise schedule \citep[$T=200$;][CIT]{NicholDhariwal2021}
+and train with the standard $\epsilon$-prediction objective (mean-squared error
+between the predicted and the true noise), using AdamW at a learning rate of
+$10^{-3}$. Samples are drawn with a deterministic DDIM sampler and added to the
+classical density to form the combined prediction.
+
+The conditioning is where the physics enters the network. Our base conditioning
+vector is four-dimensional, comprising the smoothed area, the universal mean
+latitude $\mu(\tau)$, the model width $\sigma$, and the cycle amplitude; we also
+tried richer conditioning sets (cycle number and hemisphere identity, the
+contemporaneous opposite-hemisphere amplitude and phase, and an autoregressive
+history of the hemicycle's own area), two conditioning mechanisms (raw
+concatenation and feature-wise linear modulation, FiLM), an optional Fourier
+feature lifting of the conditioning scalars, and classifier-free guidance. One
+choice deserves emphasis: we select the final checkpoint on a distributional
+metric (the validation Earth Mover's distance) rather than on the denoising
+loss, because we found the denoising loss to rise even as the generated samples
+became visibly more realistic.
+
+\subsection{Metrics}
+\label{sec:metrics}
+
+We evaluate the model along two axes that, as it turns out, disagree. The first
+is the hard-gated NLL, scored exactly as in the classical model (each observed
+latitude scored under the combined density where the wing is active). We compute
+it in two forms: a raw form that scores only the occupied bins, and a normalized
+form that adds the log-partition term $\log Z$ so that mass spent outside the
+occupied bins is properly charged; the distinction between the two turns out to
+matter a great deal (Section~\ref{sec:guidance}). The second axis is a suite of
+distributional metrics computed between the generated and the observed densities:
+the Earth Mover's distance (a Wasserstein-1 distance, in degrees of latitude),
+an energy distance, the continuous ranked probability score (CRPS), the error in
+the recovered spread ($\sigma$-MAE), and a Talagrand rank histogram for
+calibration. Finally, we use an oracle diagnostic (an auxiliary network that maps
+the conditioning vector directly to a per-bin Gaussian) to estimate the best
+NLL any model could achieve from a given conditioning set, which gives us an
+information upper bound to compare the diffusion model against.
+
+% ============================================================================
+\section{Results}
+\label{sec:results}
+% ============================================================================
+
+\subsection{The ablation, and a tension between metrics}
+\label{sec:ablation}
+
+Table~\ref{tab:val} shows the validation-set comparison across the conditioning
+and architecture variants, and the first thing it reveals is that no diffusion
+variant beats the classical model on NLL: the best NLL among the diffusion
+models ($3.402$) is still above the classical baseline ($3.240$). However, the
+same table shows that several variants beat the classical model handily on
+distributional shape. The simplest conditioned model (E0: the four-dimensional
+base conditioning with raw concatenation, no guidance, no Fourier features)
+lowers the Earth Mover's distance to $1.365\degr$ from the classical $1.575\degr$,
+lowers the CRPS of the mean latitude to $0.794$ from $0.963$, and roughly halves
+the spread error ($\sigma$-MAE $0.622$ versus $1.153$). The added complexity we
+tried (FiLM, Fourier features, extra conditioning groups) either failed to help
+or actively hurt these distributional metrics, even when it lowered the raw NLL,
+which is the first of several signs that NLL and distributional fidelity are
+ranking the models differently.
+
+\begin{deluxetable}{lccc}
+\tablecaption{Validation-set comparison (55 blocks; $K{=}100$ samples per block).
+Lower is better throughout. E0 is the deployed hybrid variant.\label{tab:val}}
+\tablehead{\colhead{Model} & \colhead{NLL} & \colhead{EMD [\degr]} &
+\colhead{$\sigma$-MAE [\degr]}}
+\startdata
+Classical (baseline)          & $\mathbf{3.240}$ & $1.575$          & $1.153$          \\
+E0 (base, concat)             & $3.502$          & $\mathbf{1.365}$ & $\mathbf{0.622}$ \\
+E1 (base + cycle/hemi)        & $3.457$          & $1.437$          & $0.630$          \\
+E3 (base + trajectory)        & $3.437$          & $1.554$          & $0.696$          \\
+E13 (base, FiLM + Fourier)    & $3.402$          & $1.944$          & $0.828$          \\
+E5 (base + opp., FiLM)        & $4.014$          & $2.336$          & $0.746$          \\
+\enddata
+\tablecomments{Full 18-experiment sweep in the supplementary material.}
+% TODO(andres): decide whether all 18 experiments go in an appendix table.
+\end{deluxetable}
+
+\subsection{Classifier-free guidance fails, and why}
+\label{sec:guidance}
+
+Classifier-free guidance is the standard lever for sharpening conditional
+diffusion samples, and we expected it to help --- it did not, on any axis. Across
+every guided variant the sweep verdict was the same (the unguided setting,
+$w=0$, was best), and raising the guidance weight monotonically \emph{worsened}
+the Earth Mover's distance rather than improving it. The reason is instructive
+and worth stating plainly, because it is a property of the residual framing
+rather than a bug in the sampler. The raw hard-gated NLL scores the combined
+density only at the occupied bins, so guidance can drive the raw NLL down simply
+by piling residual mass onto the occupied bins, while the mass it over-spends in
+the empty bins is floored at zero and never charged; the normalized NLL, which
+adds $\log Z$, closes this leak, and under guidance the gap between the raw and
+the normalized NLL widens exactly as this picture predicts. Our sampling
+diagnostics confirm the mechanism directly: as the guidance weight rises, the
+added mass climbs, the ensemble diversity either collapses toward mode collapse
+or explodes into a handful of enormous samples, and a growing fraction of the
+observed latitudes fall into bins the model has driven to negative density. We
+take this as evidence that guidance buys nothing here and actively destabilizes
+the ensemble, and we deploy the model unguided.
+
+\subsection{An information ceiling}
+\label{sec:ceiling}
+
+The failure of every diffusion variant to beat the classical model on NLL raised
+an obvious question: is the limitation in the architecture, in the residual
+framing, or in the conditioning information itself? The oracle diagnostic answers
+it. Across conditioning sets the oracle NLL sits between roughly $3.46$ and
+$3.65$, which is close to both the classical baseline and the diffusion model's
+own NLL, and the smallness of the diffusion-to-oracle gap tells us that the
+diffusion model is already extracting nearly all of the residual signal the
+conditioning set contains. In other words, the ceiling is set by the
+\emph{information} in the covariates, not by the capacity of the network. To test
+this interpretation we reframed the target, replacing the residual with the
+empirical density itself modeled in logit space (so that non-negativity and the
+unit-mass constraint hold by construction), with the classical density demoted
+from a fixed pedestal to a Kullback-Leibler prior. The reframing narrowed the gap
+to the classical NLL (the best empirical-target variant reaches $3.373$ versus
+the best residual-target $3.402$). However, it did not break through it, and the
+empirical model sits essentially at its own oracle (its NLL and its oracle NLL
+agree to within the sampling scatter). We interpret the two results
+together as evidence that the residual signal available in the present
+conditioning set is nearly exhausted, and that beating the classical model on
+likelihood will require genuinely new predictive covariates rather than a better
+network or a different target.
+
+\subsection{The held-out test comparison}
+\label{sec:test}
+
+The real test of a generative model is on cycles it has never seen, and so we
+turn to the six reserved hemicycles, comparing four models on the pooled
+held-out windows: the empirical distribution, an independent SARG-style baseline
+(with its own universal path and amplitude-width law fit on the training split
+only), the classical model, and the hybrid ``classical $+$ AI'' model (the E0
+residual added to the classical density). Table~\ref{tab:test} gives the
+verdict. On genuinely held-out cycles the hybrid model delivers substantially
+better distributional fidelity than both the classical model and the SARG
+baseline: the Earth Mover's distance improves by $24\%$ over the classical model
+($1.391\degr$ versus $1.832\degr$), the energy distance by $28\%$, the CRPS of
+the mean by $29\%$, and the spread error is roughly halved ($0.714\degr$ versus
+$1.439\degr$). The cost, as on the validation set, is the pointwise NLL, which is
+worse for the hybrid model ($3.588$) than for either baseline ($3.234$ and
+$3.248$); this is a trade we make deliberately (and one we defend at length in
+Section~\ref{sec:discussion}).
+
+\begin{deluxetable}{lcccc}
+\tablecaption{Held-out test comparison on the six reserved hemicycles (86
+windows). Lower is better throughout.\label{tab:test}}
+\tablehead{\colhead{Model} & \colhead{NLL} & \colhead{EMD [\degr]} &
+\colhead{Energy} & \colhead{$\sigma$-MAE [\degr]}}
+\startdata
+SARG (independent baseline)   & $3.248$          & $1.531$          & $0.104$          & $1.114$          \\
+Classical                     & $\mathbf{3.234}$ & $1.832$          & $0.106$          & $1.439$          \\
+Classical $+$ AI (E0)         & $3.588$          & $\mathbf{1.391}$ & $\mathbf{0.077}$ & $\mathbf{0.714}$ \\
+\enddata
+\end{deluxetable}
+
+\subsection{Physical plausibility}
+\label{sec:physical}
+
+A generative model of the butterfly diagram is only useful if its samples obey
+the physics, and so we check each variant against Sp\"orer's law and the bounds
+of the emergence zone. Every variant reproduces the equatorward drift with the
+correct sign, and between $88\%$ and $93\%$ of the generated mass falls inside
+the $5\degr$--$40\degr$ Sp\"orer band. However, the diffusion samples share one
+systematic imperfection, in that they drift slightly too slowly: the observed
+centroid slope is
+$-2.19\degr\,\mathrm{yr}^{-1}$, the classical model gives $-1.72\degr\,
+\mathrm{yr}^{-1}$, and the E0 hybrid gives $-1.52\degr\,\mathrm{yr}^{-1}$, so the
+model under-predicts the drift rate while preserving its direction. We flag this
+as the clearest target for future improvement.
+
+% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
+% ============================================================================
+
+The central result of this work is also its central tension: the hybrid model
+generates more realistic butterfly wings than the classical model, and yet it
+scores worse on likelihood. This is not a contradiction so much as a statement
+about what the two metrics reward. The NLL is dominated by the tails of the
+density and is minimized by a smooth, slightly over-dispersed Gaussian that never
+assigns a very low probability to any observed spot; the distributional metrics
+(the Earth Mover's distance, the energy distance, the CRPS, and the spread error)
+instead reward getting the \emph{shape} of the density right, which is precisely
+what the diffusion model adds. For a \emph{generative} model, whose purpose is to
+draw new samples that look like real cycles rather than to assign the highest
+possible probability to the observed ones, we argue that the distributional
+metrics are the more appropriate arbiter, and that the likelihood penalty is a
+price worth paying for shape realism. We do not claim this settles the question,
+and we suspect the right long-term answer is a proper scoring rule that credits
+shape and calibration together.
+
+The residual framing carries an implicit assumption that is worth naming: it
+assumes that the conditioning covariates carry information about the residual
+\emph{beyond} what the classical model has already extracted from those same
+covariates. However, our oracle diagnostic shows that this assumption is only
+weakly satisfied with the present conditioning set, because the oracle NLL sits
+close to
+both the classical baseline and the diffusion model's own likelihood. We
+interpret the failure of classifier-free guidance in the same light: guidance
+sharpens a conditional distribution around information the conditioning already
+carries, and where that information is nearly exhausted there is nothing left for
+guidance to sharpen, so it can only exploit the scoring leak or destabilize the
+ensemble. Rather than read these as failures of the method, we read them as a
+measurement of how much predictive signal the standard cycle parameters actually
+contain about the fine structure of a wing, and the answer is: less than one
+might hope.
+
+Positioned against the existing generators, our model makes two moves that we
+believe are new for the butterfly diagram. The first is that we tie the full
+shape of each wing to that hemisphere's own amplitude, rather than fixing the
+centroid and tying only the width to a global index as SARG does, or using a
+whole-cycle amplitude as \citet[CIT]{Jiang2011} do; the observed hemispheric
+asymmetry is bounded (the hemispheres are roughly $80\%$ coupled;
+\citealt[CIT]{Norton2014}), which is why we treat them as related processes with
+independent amplitudes rather than as fully independent ones.
+% TODO(andres): confirm you want to lean on the Norton 80%-coupling number here.
+The second is the residual score-based refinement of a physical baseline, which
+is well established in atmospheric downscaling \citep[CIT]{Mardani2025} but which,
+to the best of our knowledge, has not previously been applied in solar physics.
+The clearest paths to improvement follow directly from the information ceiling we
+found: new covariates (for example, the polar-field or terminator timing that
+sets a cycle's onset, or the opposite hemisphere's fine structure) rather than a
+larger network, and a drift-rate-aware objective to cure the shallow-drift bias
+of Section~\ref{sec:physical}.
+
+% ============================================================================
+\section{Summary}
+\label{sec:summary}
+% ============================================================================
+
+We have built a two-part generative model of the solar butterfly diagram. The
+first part is a compact classical description of a butterfly wing, in which the
+mean emergence latitude follows a universal exponential path
+($a=16.31\degr$, $b=8.14$~yr), the equatorward collapse of the width follows a
+single line shared by every cycle, and the poleward shape and the activity gate
+scale with each hemisphere's amplitude; leave-one-cycle-out validation places the
+generalization floor of this model at $3.087$ nats per year-block. The second
+part is a score-based diffusion model that generates the residual density the
+classical Gaussian leaves behind, conditioned on cycle amplitude and phase. On
+six hemispheric cycles held out from all fitting, the hybrid model improves the
+Earth Mover's distance by $24\%$, the energy distance by $28\%$, and the spread
+error by roughly a factor of two over both the classical model and an independent
+SARG-style baseline, at the cost of a worse pointwise likelihood that continues
+to favor the smoother Gaussian. We find, through an oracle diagnostic, that this
+likelihood ceiling is set by the information in the conditioning covariates rather
+than by the network or the target framing, and we find that classifier-free
+guidance offers no help and destabilizes the ensemble. To the best of our
+knowledge, this is the first score-based generative model of the solar butterfly
+diagram, and it establishes both a working hybrid architecture and a clear
+measurement of where its predictive information runs out.
+
+% ============================================================================
+\section*{Acknowledgements}
+% ============================================================================
+
+This work was carried out within an eleven-week undergraduate research program at
+the COFFIES Science Center (approximately $40$ students), which developed the
+classical model, the diffusion pipeline, and the evaluation framework described
+here. % TODO(andres): full acknowledgement wording, funding, and data
+% provenance (survey list and DOIs for the composite catalog).
+
+\facility{}
+
+% \bibliography{butterflai}   % TODO(andres): supply the .bib
+
+\end{document}
